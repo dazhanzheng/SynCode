@@ -4,7 +4,7 @@
 //! `reasoning_content` 三态、以及 context 裁切有**字节级控制** —— 这是
 //! 「完全掌控 context 裁切」产品路线的落点 (架构 §1, §8)。
 //!
-//! 权威行为源: `DeepSeek-API-使用指南.md`。本 crate 把该文档里散落的行为约束
+//! 权威行为源: 内部的 DeepSeek API 使用指南 (未公开)。本 crate 把该文档里散落的行为约束
 //! (§7.4/§7.5 的 reasoning_content 回传规则、§12 前缀缓存、keep-alive、
 //! finish_reason 怪癖、错误重试分类) 编码成类型与函数, 让规则由类型系统兜底。
 //!

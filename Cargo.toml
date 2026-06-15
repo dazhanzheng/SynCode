@@ -1,5 +1,5 @@
 # SynCode workspace.
-# 见 架构与工具策略.md: 纯 Rust core + 所有工具 Rust + 自建 agent loop + DeepSeek。
+# 设计依据见内部架构文档 (未公开): 纯 Rust core + 所有工具 Rust + 自建 agent loop + DeepSeek。
 # 当前为「可编译骨架」: 结构 / 类型 / trait / stub 立起来, 实现随后填 (todo!())。
 [workspace]
 resolver = "3"
