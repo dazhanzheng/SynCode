@@ -1,0 +1,26 @@
+//! SynCode 内置工具 (借鉴 Claude Code 工具设计 IP, 用 Rust 重写, 架构 §10)。
+//!
+//! 当前为 stub: 契约 (名称/描述/JSON Schema) 立起来, `call` 为 `todo!()`。
+//! 抬上限的方向 (§4) 在各工具 doc 里标注 (如 Grep 改为进程内 `ignore`/`grep` 库)。
+#![allow(dead_code, unused_variables)]
+
+mod bash;
+mod edit;
+mod grep;
+mod read;
+
+pub use bash::BashTool;
+pub use edit::EditTool;
+pub use grep::GrepTool;
+pub use read::ReadTool;
+
+use std::sync::Arc;
+use syncode_core::ToolRegistry;
+
+/// 注册全部内置工具到 registry。
+pub fn register_builtins(registry: &mut ToolRegistry) {
+    registry.register(Arc::new(ReadTool));
+    registry.register(Arc::new(EditTool));
+    registry.register(Arc::new(GrepTool));
+    registry.register(Arc::new(BashTool));
+}

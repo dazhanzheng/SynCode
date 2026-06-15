@@ -1,0 +1,12 @@
+[package]
+name = "syncode-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SynCode 内置工具 (借鉴 CC 工具设计 IP, 用 Rust 重写, §10)。当前为 stub。"
+
+[dependencies]
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+syncode-core = { workspace = true }

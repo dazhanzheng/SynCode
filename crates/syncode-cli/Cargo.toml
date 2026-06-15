@@ -1,0 +1,17 @@
+[package]
+name = "syncode-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SynCode headless 装配入口 (骨架)。"
+
+[[bin]]
+name = "syncode"
+path = "src/main.rs"
+
+[dependencies]
+syncode-core = { workspace = true }
+syncode-llm = { workspace = true }
+syncode-tools = { workspace = true }
+syncode-sandbox = { workspace = true }

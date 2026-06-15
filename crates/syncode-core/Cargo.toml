@@ -1,0 +1,14 @@
+[package]
+name = "syncode-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SynCode core: 自建 agent loop + 会话 + context 裁切 + 工具 registry + 审批。"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+syncode-llm = { workspace = true }

@@ -1,0 +1,22 @@
+# Rust build output
+/target
+**/*.rs.bk
+*.pdb
+
+# 本项目是应用 (含二进制), Cargo.lock 应提交 —— 故不忽略 Cargo.lock。
+
+# Secrets / 本地环境
+.env
+*.env
+
+# 编辑器 / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 被借鉴的第三方参考源码: 仅本地参考工具设计 (架构 §10), 不随开源仓库分发。
+/claude-code-main/
+
+# 私有文档: 设计 / 策略文档, 仅本地保留, 不进公开仓库。
+/私有文档/

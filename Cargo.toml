@@ -1,0 +1,36 @@
+# SynCode workspace.
+# 见 架构与工具策略.md: 纯 Rust core + 所有工具 Rust + 自建 agent loop + DeepSeek。
+# 当前为「可编译骨架」: 结构 / 类型 / trait / stub 立起来, 实现随后填 (todo!())。
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+repository = ""
+
+[workspace.dependencies]
+# 第三方
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
+# reqwest: 保留默认 TLS (Windows 走 SChannel, 无需 C 编译器), 仅加 json + stream。
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# 内部 crate (路径依赖, 供成员用 { workspace = true } 引用)
+syncode-llm = { path = "crates/syncode-llm" }
+syncode-core = { path = "crates/syncode-core" }
+syncode-tools = { path = "crates/syncode-tools" }
+syncode-sandbox = { path = "crates/syncode-sandbox" }
+
+[profile.dev]
+# 骨架期默认即可。
+
+[profile.release]
+lto = "thin"

@@ -1,0 +1,10 @@
+[package]
+name = "syncode-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SynCode 安全/沙箱底座 (架构 §7): 默认收紧、显式放开。当前为 trait 骨架。"
+
+[dependencies]
+thiserror = { workspace = true }

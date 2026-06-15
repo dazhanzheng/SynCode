@@ -1,0 +1,13 @@
+[package]
+name = "syncode-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SynCode DeepSeek client: 自建薄 client, 自有 wire 类型, 字节级掌控 context 裁切。"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
