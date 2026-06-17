@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use syncode_llm::wire::{FunctionDef, ToolDef};
+use syncode_lsp::LspManager;
 use thiserror::Error;
 
 /// 工具执行错误。`Display` 文案直接回给模型, 故措辞要利于模型自纠偏。
@@ -45,11 +46,19 @@ pub struct ToolCtx {
     pub files: Arc<FileStateCache>,
     /// 当前工作目录 (相对路径解析 / Grep 默认根)。
     pub cwd: PathBuf,
+    /// 共享 LSP 客户端管理器: 跨工具调用复用常驻语言服务器 (§4 代码智能 / §6.2 机制③)。
+    pub lsp: Arc<LspManager>,
 }
 
 impl ToolCtx {
+    /// standalone / 测试用: 自带一个空的 LspManager。
     pub fn new(files: Arc<FileStateCache>, cwd: PathBuf) -> Self {
-        Self { files, cwd }
+        Self::with_lsp(files, cwd, Arc::new(LspManager::new()))
+    }
+
+    /// agent loop 用: 注入**共享**的 LspManager, 全 turn 复用同一组常驻服务器 (持久活状态)。
+    pub fn with_lsp(files: Arc<FileStateCache>, cwd: PathBuf, lsp: Arc<LspManager>) -> Self {
+        Self { files, cwd, lsp }
     }
 }
 

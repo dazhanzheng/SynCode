@@ -1,6 +1,6 @@
 //! 文件工具集成测试: 验证 Read/Write/Edit/Grep 的契约 + 共享缓存联动 (必先读 / stale / 原子写)。
 
-use crate::{AstEditTool, AstGrepTool, EditTool, GrepTool, ReadTool, WriteTool};
+use crate::{AstEditTool, AstGrepTool, EditTool, GrepTool, LspTool, ReadTool, WriteTool};
 use serde_json::json;
 use std::sync::Arc;
 use syncode_core::tool::{Tool, ToolCtx};
@@ -299,6 +299,35 @@ async fn read_returns_dedup_stub_on_unchanged_reread() {
     assert!(first.content.contains("content here"));
     let second = ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
     assert!(second.content.contains("File unchanged since last read"), "{}", second.content);
+}
+
+#[tokio::test]
+#[ignore = "spawns rust-analyzer; slow and requires ra installed"]
+async fn lsp_documentsymbol_via_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("lib.rs");
+    std::fs::write(&f, "pub fn alpha() {}\npub struct Beta;\n").unwrap();
+    // 工程根 = tempdir (documentSymbol 是语法级, 不需 cargo 工程)。
+    let ctx = ToolCtx::new(Arc::new(FileStateCache::new()), dir.path().to_path_buf());
+    let out = LspTool
+        .call(json!({"operation": "documentSymbol", "file_path": f.to_str().unwrap()}), &ctx)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("alpha") && out.content.contains("Beta"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn lsp_rejects_non_rust_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.py");
+    std::fs::write(&f, "def x(): pass\n").unwrap();
+    let ctx = ctx();
+    let out = LspTool
+        .call(json!({"operation": "documentSymbol", "file_path": f.to_str().unwrap()}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.is_error && out.content.contains("only Rust"), "{}", out.content);
 }
 
 #[tokio::test]

@@ -15,6 +15,7 @@ use crate::session::Session;
 use crate::state::SessionStore;
 use crate::tool::ToolCtx;
 use std::sync::Arc;
+use syncode_lsp::LspManager;
 use syncode_llm::client::{DeepSeekClient, MODEL};
 use syncode_llm::context::normalize_for_api;
 use syncode_llm::wire::{
@@ -30,6 +31,8 @@ pub struct AgentLoop {
     approver: Arc<dyn Approver>,
     /// 跨工具共享的文件读状态缓存 (Read 写 / Edit/Write 读, §10)。
     files: Arc<FileStateCache>,
+    /// 跨工具共享的 LSP 客户端管理器 (常驻语言服务器复用, §4/§6.2)。
+    lsp: Arc<LspManager>,
     /// 可选持久化 (D2/D4)。无则纯内存。
     store: Option<SessionStore>,
     session_id: String,
@@ -43,6 +46,7 @@ impl AgentLoop {
             context: ContextManager::default(),
             approver: Arc::new(AllowAll),
             files: Arc::new(FileStateCache::new()),
+            lsp: Arc::new(LspManager::new()),
             store: None,
             session_id: "default".to_string(),
         }
@@ -191,7 +195,11 @@ impl AgentLoop {
         {
             return format!("<tool_use_error>permission denied for {name}</tool_use_error>");
         }
-        let ctx = ToolCtx::new(self.files.clone(), std::env::current_dir().unwrap_or_default());
+        let ctx = ToolCtx::with_lsp(
+            self.files.clone(),
+            std::env::current_dir().unwrap_or_default(),
+            self.lsp.clone(),
+        );
         match tool.call(args, &ctx).await {
             Ok(out) if out.is_error => format!("<tool_use_error>{}</tool_use_error>", out.content),
             Ok(out) => out.content,

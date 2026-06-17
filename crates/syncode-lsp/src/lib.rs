@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -213,6 +214,18 @@ impl LspClient {
         .await
     }
 
+    /// 全量替换某文档内容 (TextDocumentSyncKind.Full)。模型改文件后用它让服务器看到最新内容。
+    pub async fn did_change_full(&self, uri: &str, version: i64, text: &str) -> Result<(), LspError> {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [ { "text": text } ]
+            }),
+        )
+        .await
+    }
+
     /// 等服务器索引就绪 (rust-analyzer `serverStatus.quiescent==true`)。definition/references 这类
     /// **需索引**的查询前调; documentSymbol 不需要。超时返回 false。
     pub async fn wait_until_ready(&self, timeout: Duration) -> bool {
@@ -303,6 +316,63 @@ impl Drop for LspClient {
     fn drop(&mut self) {
         // 兜底: 没显式 shutdown 也别泄漏 ra 进程 (start_kill 是同步的)。
         let _ = self.child.start_kill();
+    }
+}
+
+/// 跨工具调用复用的 LSP 客户端管理器: 按工程根**惰性启动并缓存**常驻 [`LspClient`] (v1 = rust-analyzer),
+/// 跟踪每个文档的打开/版本以做全量同步。放进 `ToolCtx`, 与文件缓存一样跨工具调用共享 (持久活状态的前提)。
+pub struct LspManager {
+    server: String,
+    clients: AsyncMutex<HashMap<PathBuf, Arc<LspClient>>>,
+    versions: AsyncMutex<HashMap<String, i64>>,
+}
+
+impl LspManager {
+    pub fn new() -> Self {
+        Self {
+            server: "rust-analyzer".to_string(),
+            clients: AsyncMutex::new(HashMap::new()),
+            versions: AsyncMutex::new(HashMap::new()),
+        }
+    }
+
+    /// 取 (或惰性启动并缓存) 某工程根的客户端。第一次会 spawn + initialize, 之后复用同一个常驻进程。
+    pub async fn client_for_root(&self, root: &Path) -> Result<Arc<LspClient>, LspError> {
+        let mut map = self.clients.lock().await;
+        if let Some(c) = map.get(root) {
+            return Ok(c.clone());
+        }
+        let client = Arc::new(LspClient::spawn(&self.server, &path_to_file_uri(root)).await?);
+        map.insert(root.to_path_buf(), client.clone());
+        Ok(client)
+    }
+
+    /// 把文档当前内容同步给服务器: 首次 `didOpen`, 之后 `didChange` (全量)。
+    pub async fn sync_doc(
+        &self,
+        client: &LspClient,
+        uri: &str,
+        language_id: &str,
+        text: &str,
+    ) -> Result<(), LspError> {
+        let mut versions = self.versions.lock().await;
+        match versions.get_mut(uri) {
+            None => {
+                client.did_open(uri, language_id, text).await?;
+                versions.insert(uri.to_string(), 1);
+            }
+            Some(ver) => {
+                *ver += 1;
+                client.did_change_full(uri, *ver, text).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for LspManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

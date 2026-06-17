@@ -10,6 +10,7 @@ mod bash;
 mod edit;
 mod fsutil;
 mod grep;
+mod lsp;
 mod read;
 mod write;
 
@@ -21,6 +22,7 @@ pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use grep::GrepTool;
+pub use lsp::LspTool;
 pub use read::ReadTool;
 pub use write::WriteTool;
 
@@ -35,5 +37,6 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(AstGrepTool));
     registry.register(Arc::new(AstEditTool));
+    registry.register(Arc::new(LspTool));
     registry.register(Arc::new(BashTool));
 }

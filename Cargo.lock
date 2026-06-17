@@ -1299,6 +1299,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syncode-llm",
+ "syncode-lsp",
  "thiserror",
  "tokio",
 ]
@@ -1342,6 +1343,7 @@ dependencies = [
  "serde_json",
  "syncode-ast",
  "syncode-core",
+ "syncode-lsp",
  "tempfile",
  "tokio",
 ]

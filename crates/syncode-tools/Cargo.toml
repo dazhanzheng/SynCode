@@ -11,9 +11,12 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 syncode-core = { workspace = true }
 syncode-ast = { workspace = true }
+syncode-lsp = { workspace = true }
 tempfile = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }
+# Lsp 工具用 tokio::time (诊断推送等待); 异步本身经 async-trait。
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
