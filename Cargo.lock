@@ -1316,6 +1316,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "syncode-lsp"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "syncode-sandbox"
 version = "0.0.0"
 dependencies = [
