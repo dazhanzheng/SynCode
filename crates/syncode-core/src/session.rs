@@ -17,6 +17,11 @@ impl Session {
         Self { messages: vec![Message::system(system)] }
     }
 
+    /// 从既有消息序列重建 (resume: 从持久化 store 载入的 canonical 全文)。
+    pub fn from_messages(messages: Vec<Message>) -> Self {
+        Self { messages }
+    }
+
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);
     }

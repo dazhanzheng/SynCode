@@ -10,3 +10,9 @@ description = "SynCode 内置工具 (借鉴 CC 工具设计 IP, 用 Rust 重写,
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 syncode-core = { workspace = true }
+tempfile = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

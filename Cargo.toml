@@ -22,6 +22,13 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 # reqwest: 保留默认 TLS (Windows 走 SChannel, 无需 C 编译器), 仅加 json + stream。
 reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+# 文件工具底层 (§5 第一梯队: 原子写 / 库化 ripgrep)。
+tempfile = "3"
+ignore = "0.4"
+regex = "1"
+# rusqlite bundled: 自带 SQLite C 源, 编进二进制 (单文件持久化, D2/D4 event-log/checkpoint)。
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # 内部 crate (路径依赖, 供成员用 { workspace = true } 引用)
 syncode-llm = { path = "crates/syncode-llm" }

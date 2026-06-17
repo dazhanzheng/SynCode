@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use syncode_core::tool::{Tool, ToolError, ToolOutput};
+use syncode_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
 pub struct BashTool;
 
@@ -36,7 +36,7 @@ impl Tool for BashTool {
         true
     }
 
-    async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
+    async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         todo!("spawn under sandbox via tokio::process + portable-pty (guide §4/§7)")
     }
 }

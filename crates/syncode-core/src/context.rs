@@ -19,4 +19,9 @@ impl ContextManager {
     pub fn prepare(&self, messages: &mut Vec<Message>) {
         self.policy.apply(messages);
     }
+
+    /// 纯投影 (D1): 从 full 原文 log 现算要发送的 wire `messages`, **不改 canonical**。
+    pub fn project(&self, full_log: &[Message]) -> Vec<Message> {
+        self.policy.project(full_log)
+    }
 }

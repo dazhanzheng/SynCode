@@ -6,13 +6,19 @@
 
 mod bash;
 mod edit;
+mod fsutil;
 mod grep;
 mod read;
+mod write;
+
+#[cfg(test)]
+mod tests;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
+pub use write::WriteTool;
 
 use std::sync::Arc;
 use syncode_core::ToolRegistry;
@@ -20,6 +26,7 @@ use syncode_core::ToolRegistry;
 /// 注册全部内置工具到 registry。
 pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(ReadTool));
+    registry.register(Arc::new(WriteTool));
     registry.register(Arc::new(EditTool));
     registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(BashTool));

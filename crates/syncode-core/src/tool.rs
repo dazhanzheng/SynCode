@@ -2,8 +2,11 @@
 //!
 //! 核心理念: **error message 是写给模型读的** —— 措辞为引导模型下一步, 不是给人看。
 
+use crate::file_state::FileStateCache;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
 use syncode_llm::wire::{FunctionDef, ToolDef};
 use thiserror::Error;
 
@@ -35,6 +38,21 @@ impl ToolOutput {
     }
 }
 
+/// 工具运行时上下文 (借鉴 CC `ToolUseContext`): 携带跨工具共享的状态。
+#[derive(Clone)]
+pub struct ToolCtx {
+    /// 共享文件读状态缓存: Read 写、Edit/Write 读 —— 据此做「必先读」+ stale 检测 (§10)。
+    pub files: Arc<FileStateCache>,
+    /// 当前工作目录 (相对路径解析 / Grep 默认根)。
+    pub cwd: PathBuf,
+}
+
+impl ToolCtx {
+    pub fn new(files: Arc<FileStateCache>, cwd: PathBuf) -> Self {
+        Self { files, cwd }
+    }
+}
+
 /// 工具契约。`Send + Sync` 以便放进 `Arc<dyn Tool>` 跨任务共享。
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -52,8 +70,9 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    /// 执行。`args` 是已从 `function.arguments` (JSON 字符串) 解析出的对象。
-    async fn call(&self, args: Value) -> Result<ToolOutput, ToolError>;
+    /// 执行。`args` 是已从 `function.arguments` (JSON 字符串) 解析出的对象;
+    /// `ctx` 携带共享文件状态缓存等运行时上下文 (§10 文件工具联动)。
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
 
     /// 生成发给模型的工具定义。
     fn to_def(&self) -> ToolDef {

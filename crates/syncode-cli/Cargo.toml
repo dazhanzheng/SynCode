@@ -15,3 +15,4 @@ syncode-core = { workspace = true }
 syncode-llm = { workspace = true }
 syncode-tools = { workspace = true }
 syncode-sandbox = { workspace = true }
+tokio = { workspace = true }

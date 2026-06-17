@@ -24,11 +24,15 @@ pub enum Role {
 
 /// 一条对话消息。
 ///
-/// `reasoning_content` 三态 (指南 §7.5) —— context 裁切的核心:
-/// - `None`        → 整字段省略。用于「已被后续 user 关闭的历史工具轮」(可删, 仍 200)。
-/// - `Some("")`    → 发送空串 `"reasoning_content":""`。用于「在途 (未关闭) 的 tool_calls 轮」:
-///                   既满足校验 (省略会 400), 又回收这段 CoT 占用的 token。
-/// - `Some(cot)`   → 原样回传完整思维链。
+/// `reasoning_content` 三态 (指南 §7.4/§7.5, 2026-06-16 实测) —— context 裁切的核心:
+/// - `Some(cot)`   → 回传完整思维链。**保留 = 模型会读到并用于推理** (实测: closed 工具轮的
+///                   CoT 仍被喂给模型)。用于需要推理连续性的最近若干工具轮。
+/// - `Some("")`    → 空串 `"reasoning_content":""`。满足校验但**丢掉该轮 CoT 文字** (回收 token)。
+/// - `None`        → 整字段省略。仅「已被后续 user 关闭的历史工具轮」可这样 (仍 200), 但这会
+///                   **丢掉该轮推理连续性, 不是免费** —— 故只对超出"保留窗口"的旧轮用。
+///
+/// 400 边界 (精确): 在途跨度内「第 2 个及以后」的 tool_calls 轮缺 reasoning_content 才 400;
+/// 「第一个 (或唯一) 工具轮」省略也不报错 (首轮豁免)。统一用 `Some("")` 最稳, 不依赖该豁免。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -160,6 +164,9 @@ pub struct ChatRequest {
     /// `{"type":"json_object"}` 开启 JSON 输出 (§10)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
+    /// `{"include_usage": true}`: 流式下在末块带 usage (§8)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<Value>,
 }
 
 impl ChatRequest {
@@ -177,6 +184,7 @@ impl ChatRequest {
             stop: None,
             stream: false,
             response_format: None,
+            stream_options: None,
         }
     }
 }

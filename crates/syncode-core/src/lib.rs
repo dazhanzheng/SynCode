@@ -12,16 +12,19 @@
 
 pub mod agent;
 pub mod context;
+pub mod file_state;
 pub mod permission;
 pub mod registry;
 pub mod session;
+pub mod state;
 pub mod tool;
 
 pub use agent::AgentLoop;
 pub use context::ContextManager;
+pub use file_state::{FileState, FileStateCache};
 pub use registry::ToolRegistry;
 pub use session::Session;
-pub use tool::{Tool, ToolError, ToolOutput};
+pub use tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
 /// 重导出 wire crate, 便于下游构造消息/工具定义。
 pub use syncode_llm;
