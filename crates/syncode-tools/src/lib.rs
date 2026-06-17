@@ -4,6 +4,8 @@
 //! 抬上限的方向 (§4) 在各工具 doc 里标注 (如 Grep 改为进程内 `ignore`/`grep` 库)。
 #![allow(dead_code, unused_variables)]
 
+mod ast_edit;
+mod ast_grep;
 mod bash;
 mod edit;
 mod fsutil;
@@ -14,6 +16,8 @@ mod write;
 #[cfg(test)]
 mod tests;
 
+pub use ast_edit::AstEditTool;
+pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use grep::GrepTool;
@@ -29,5 +33,7 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(WriteTool));
     registry.register(Arc::new(EditTool));
     registry.register(Arc::new(GrepTool));
+    registry.register(Arc::new(AstGrepTool));
+    registry.register(Arc::new(AstEditTool));
     registry.register(Arc::new(BashTool));
 }

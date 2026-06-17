@@ -35,6 +35,7 @@ syncode-llm = { path = "crates/syncode-llm" }
 syncode-core = { path = "crates/syncode-core" }
 syncode-tools = { path = "crates/syncode-tools" }
 syncode-sandbox = { path = "crates/syncode-sandbox" }
+syncode-ast = { path = "crates/syncode-ast" }
 
 [profile.dev]
 # 骨架期默认即可。

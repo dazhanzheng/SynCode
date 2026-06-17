@@ -5,6 +5,7 @@ use crate::fsutil;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use syncode_ast::Engine;
 use syncode_core::file_state::FileState;
 use syncode_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
@@ -95,6 +96,20 @@ impl Tool for EditTool {
             .map_err(|e| ToolError::Exec(format!("write failed for {file_path}: {e}")))?;
 
         let mtime = fsutil::mtime_ms(&path).unwrap_or(0);
+
+        // 改后语法护栏 (已知语言): **不阻断** (允许分步重构途中暂时破语法), 但把"这次改动弄坏了语法"
+        // 作为 affordance 提示模型自纠 (§10 error-message-as-affordance)。硬保证合法走 AstEdit。
+        let mut msg = format!("The file {file_path} has been updated successfully.");
+        if let Ok(engine) = Engine::for_path(&path) {
+            if let Some(detail) = engine.introduced_syntax_error(&current, &updated) {
+                msg.push_str(&format!(
+                    " ⚠️ Note: this edit appears to introduce a syntax error ({detail}). \
+                     If that was not intended, fix it in a follow-up edit (or use AstEdit for a \
+                     syntax-guaranteed change)."
+                ));
+            }
+        }
+
         ctx.files.set(
             &path,
             FileState {
@@ -105,8 +120,6 @@ impl Tool for EditTool {
                 is_partial_view: false,
             },
         );
-        Ok(ToolOutput::ok(format!(
-            "The file {file_path} has been updated successfully."
-        )))
+        Ok(ToolOutput::ok(msg))
     }
 }

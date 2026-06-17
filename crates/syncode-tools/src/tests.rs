@@ -1,6 +1,6 @@
 //! 文件工具集成测试: 验证 Read/Write/Edit/Grep 的契约 + 共享缓存联动 (必先读 / stale / 原子写)。
 
-use crate::{EditTool, GrepTool, ReadTool, WriteTool};
+use crate::{AstEditTool, AstGrepTool, EditTool, GrepTool, ReadTool, WriteTool};
 use serde_json::json;
 use std::sync::Arc;
 use syncode_core::tool::{Tool, ToolCtx};
@@ -151,6 +151,141 @@ async fn edit_preserves_crlf_line_endings() {
         .unwrap();
     // CRLF 保留, 不被改成 LF。
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "ALPHA\r\nbeta\r\n");
+}
+
+// ---- AST 层工具 (syncode-ast 驱动): 结构化搜索 / 结构化改写 / Edit 改后语法护栏 ----
+
+const RUST_FILE: &str = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+
+#[tokio::test]
+async fn ast_grep_finds_structural_matches_in_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.rs");
+    std::fs::write(&f, RUST_FILE).unwrap();
+    let ctx = ctx();
+    // 单文件: 语言按 .rs 扩展名推断, 无需 lang。
+    let out = AstGrepTool
+        .call(json!({"pattern": "let $N = $V;", "path": f.to_str().unwrap()}), &ctx)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("let x = 1;") && out.content.contains("let y = 2;"), "{}", out.content);
+    // 含行号。
+    assert!(out.content.contains(":2:") && out.content.contains(":3:"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn ast_grep_directory_search_filters_by_lang() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), RUST_FILE).unwrap();
+    std::fs::write(dir.path().join("b.txt"), "let z = 9; (not rust)\n").unwrap();
+    let ctx = ctx();
+    let out = AstGrepTool
+        .call(json!({"pattern": "let $N = $V;", "path": dir.path().to_str().unwrap(), "lang": "rust"}), &ctx)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    // 只搜到 .rs 里的, .txt 被 file_types 过滤掉。
+    assert!(out.content.contains("a.rs"), "{}", out.content);
+    assert!(!out.content.contains("b.txt"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn ast_grep_bad_pattern_reports_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.rs");
+    std::fs::write(&f, RUST_FILE).unwrap();
+    let ctx = ctx();
+    let out = AstGrepTool
+        .call(json!({"pattern": "", "path": f.to_str().unwrap()}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.is_error && out.content.contains("Invalid ast-grep pattern"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn ast_edit_requires_prior_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.rs");
+    std::fs::write(&f, RUST_FILE).unwrap();
+    let ctx = ctx();
+    let out = AstEditTool
+        .call(
+            json!({"file_path": f.to_str().unwrap(), "pattern": "let $N = $V;", "rewrite": "const $N: i32 = $V;"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error && out.content.contains("File has not been read yet"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn ast_edit_rewrites_every_match_and_verifies_syntax() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.rs");
+    std::fs::write(&f, RUST_FILE).unwrap();
+    let ctx = ctx();
+    let fp = f.to_str().unwrap();
+    ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
+    let out = AstEditTool
+        .call(json!({"file_path": fp, "pattern": "let $N = $V;", "rewrite": "const $N: i32 = $V;"}), &ctx)
+        .await
+        .unwrap();
+    assert!(!out.is_error && out.content.contains("2 structural replacements"), "{}", out.content);
+    let after = std::fs::read_to_string(&f).unwrap();
+    assert!(after.contains("const x: i32 = 1;") && after.contains("const y: i32 = 2;"), "{after}");
+}
+
+#[tokio::test]
+async fn ast_edit_rejects_syntax_breaking_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.rs");
+    std::fs::write(&f, RUST_FILE).unwrap();
+    let ctx = ctx();
+    let fp = f.to_str().unwrap();
+    ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
+    let out = AstEditTool
+        .call(json!({"file_path": fp, "pattern": "let $N = $V;", "rewrite": "let $N = ;"}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.is_error && out.content.contains("Rewrite rejected"), "{}", out.content);
+    // 被拒后文件原样不动。
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), RUST_FILE);
+}
+
+#[tokio::test]
+async fn ast_edit_no_match_makes_no_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.rs");
+    std::fs::write(&f, RUST_FILE).unwrap();
+    let ctx = ctx();
+    let fp = f.to_str().unwrap();
+    ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
+    let out = AstEditTool
+        .call(json!({"file_path": fp, "pattern": "while $C {}", "rewrite": "loop {}"}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.is_error && out.content.contains("matched nothing"), "{}", out.content);
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), RUST_FILE);
+}
+
+#[tokio::test]
+async fn edit_warns_when_it_breaks_syntax_but_still_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.rs");
+    std::fs::write(&f, "fn a() {}\n").unwrap();
+    let ctx = ctx();
+    let fp = f.to_str().unwrap();
+    ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
+    // 把 `{}` 改成 `{` —— 破语法, 但 Edit 仍应用 + 警告 (非阻断)。
+    let out = EditTool
+        .call(json!({"file_path": fp, "old_string": "{}", "new_string": "{"}), &ctx)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("updated successfully"), "{}", out.content);
+    assert!(out.content.contains("syntax error"), "warning missing: {}", out.content);
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "fn a() {\n");
 }
 
 #[tokio::test]
