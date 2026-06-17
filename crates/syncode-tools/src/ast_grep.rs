@@ -17,10 +17,16 @@ impl Tool for AstGrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search code by syntax structure using an ast-grep pattern (e.g. `println!($$$)`, \
-         `let $N = $V;`). Metavariables must be UPPERCASE ($NAME) or `$_`; `$$$` matches a list of \
-         nodes. Finds matches a text regex cannot express. Pass `lang` (e.g. \"rust\") when searching \
-         a directory; for a single file the language is inferred from the extension."
+        "Search code by syntax structure using an ast-grep pattern — finds matches a text regex \
+         cannot express.\n\
+         Usage:\n\
+         - The pattern is real code with metavariables: `$NAME` matches one node, `$$$` matches a \
+         list (e.g. `println!($$$)`, `let $N = $V;`, `fn $F($$$) -> $R { $$$ }`).\n\
+         - Metavariables must be UPPERCASE ($NAME) or `$_`; lowercase names are matched literally.\n\
+         - Pass `lang` (e.g. \"rust\") when searching a directory; for a single file it is inferred \
+         from the extension.\n\
+         - Filter with the glob parameter; head_limit caps results. Output is `path:line:match`.\n\
+         - For a plain-text or regex search, use Grep instead."
     }
 
     fn parameters(&self) -> Value {

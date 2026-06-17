@@ -22,10 +22,16 @@ impl Tool for AstEditTool {
     }
 
     fn description(&self) -> &str {
-        "Structurally rewrite a file: replace every node matching an ast-grep `pattern` with \
-         `rewrite` (metavariables like $N carry over from pattern to rewrite). The result is \
-         re-parsed and the edit is REJECTED if it would introduce a syntax error. You must Read \
-         the file first."
+        "Rewrite code by syntax structure: replace every node matching an ast-grep `pattern` with \
+         `rewrite`, and the change is REJECTED if it would introduce a syntax error.\n\
+         Usage:\n\
+         - You must Read the file first; this tool errors otherwise.\n\
+         - `pattern` matches like AstGrep (metavariables UPPERCASE, `$$$` for lists); reuse the same \
+         metavariables in `rewrite`, e.g. pattern `let $N = $V;` → rewrite `const $N: i32 = $V;`.\n\
+         - After the edit the whole file is re-parsed; if the result is not syntactically valid the \
+         edit is rejected and the file is left unchanged.\n\
+         - `lang` is inferred from the file extension unless given.\n\
+         - For an exact-text replacement rather than a structural one, use Edit."
     }
 
     fn parameters(&self) -> Value {

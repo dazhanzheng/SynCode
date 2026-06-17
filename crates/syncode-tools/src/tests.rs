@@ -300,3 +300,23 @@ async fn read_returns_dedup_stub_on_unchanged_reread() {
     let second = ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
     assert!(second.content.contains("File unchanged since last read"), "{}", second.content);
 }
+
+#[tokio::test]
+async fn read_emits_cat_n_line_numbers_offset_aware() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("n.txt");
+    std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+    let ctx = ctx();
+    let fp = f.to_str().unwrap();
+
+    // 全文: cat -n 行号 (右对齐 + tab + 内容)。
+    let full = ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
+    assert!(full.content.contains("1\talpha"), "{}", full.content);
+    assert!(full.content.contains("2\tbeta"), "{}", full.content);
+    assert!(full.content.contains("3\tgamma"), "{}", full.content);
+
+    // 窗口: 行号是**真实文件行号** (offset-aware), 不是从 1 重新数。
+    let win = ReadTool.call(json!({ "file_path": fp, "offset": 2, "limit": 1 }), &ctx).await.unwrap();
+    assert!(win.content.contains("2\tbeta"), "{}", win.content);
+    assert!(!win.content.contains("alpha") && !win.content.contains("gamma"), "{}", win.content);
+}

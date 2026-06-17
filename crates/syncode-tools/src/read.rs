@@ -20,7 +20,16 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file from the local filesystem. Supports an optional line window via offset/limit."
+        "Read a file from the local filesystem and return its text content.\n\
+         Usage:\n\
+         - file_path must be an absolute path, not a relative one.\n\
+         - By default the whole file is returned; for a large file pass offset (1-based start \
+         line) and limit (number of lines) to read just that window.\n\
+         - Output is in `cat -n` format: every line is prefixed with its line number and a tab, so \
+         line numbers line up with Grep/AstGrep results.\n\
+         - You must Read a file before you can Edit or Write it — those tools error without a prior Read.\n\
+         - Re-reading an unchanged file returns a short 'unchanged' notice instead of the full content.\n\
+         - This reads files, not directories."
     }
 
     fn parameters(&self) -> Value {
@@ -81,16 +90,22 @@ impl Tool for ReadTool {
     }
 }
 
-/// 取行窗口 (1-based offset, limit 行)。无 offset/limit 则返回全文。
+/// 取行窗口并加 `cat -n` 行号 (右对齐 6 宽 + tab + 内容)。1-based offset, limit 行;
+/// 无 offset/limit 则整文件。行号用**真实文件行号** (offset-aware), 让模型能与 Grep/AstGrep 的
+/// `path:line:` 输出对齐定位。注意: 缓存里仍存**裸全文** (供 Edit 精确匹配 + stale 比较), 行号只进展示。
 fn apply_window(content: &str, offset: Option<u64>, limit: Option<u64>) -> String {
-    if offset.is_none() && limit.is_none() {
-        return content.to_string();
-    }
     let lines: Vec<&str> = content.lines().collect();
     let start = (offset.unwrap_or(1).max(1) as usize) - 1;
     let end = match limit {
         Some(l) => (start + l as usize).min(lines.len()),
         None => lines.len(),
     };
-    lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default()
+    lines
+        .get(start..end)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

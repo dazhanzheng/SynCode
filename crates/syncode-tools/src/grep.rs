@@ -16,8 +16,15 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents with a regular expression (in-process, gitignore-aware). \
-         Filter by glob; choose content/files_with_matches/count output."
+        "Search file contents with a regular expression, in-process and gitignore-aware.\n\
+         Usage:\n\
+         - Prefer this over running `grep` or `rg` through Bash.\n\
+         - Full regex syntax via the Rust `regex` engine; escape literal regex metacharacters \
+         (e.g. `\\{`, `\\(`). Each pattern is matched within a single line.\n\
+         - Filter files with the glob parameter (e.g. \"*.rs\").\n\
+         - output_mode: \"content\" shows matching lines, \"files_with_matches\" shows file paths \
+         (default), \"count\" shows per-file match counts; head_limit caps the number of results.\n\
+         - To search by code structure instead of text, use AstGrep."
     }
 
     fn parameters(&self) -> Value {

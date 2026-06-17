@@ -17,8 +17,14 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file (creates a new file, or fully overwrites an existing one). \
-         An existing file must be Read first."
+        "Write content to a file, creating a new file or fully overwriting an existing one.\n\
+         Usage:\n\
+         - An existing file must be Read first; this tool errors if you overwrite an existing file \
+         without reading it.\n\
+         - Prefer the Edit tool to change an existing file (it only replaces the targeted text); use \
+         Write only to create a new file or do a complete rewrite.\n\
+         - Do not create documentation or README (*.md) files unless the user explicitly asks for them.\n\
+         - file_path must be an absolute path."
     }
 
     fn is_dangerous(&self) -> bool {

@@ -18,8 +18,17 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Replace an exact, unique occurrence of old_string with new_string in a file. \
-         Set replace_all to replace every occurrence. You must Read the file first."
+        "Perform an exact string replacement in a file: replace a single unique occurrence of \
+         old_string with new_string, or set replace_all to replace every occurrence.\n\
+         Usage:\n\
+         - You must Read the file at least once before editing; this tool errors otherwise.\n\
+         - Read shows lines in `cat -n` format (line number + tab); the file itself has no such \
+         prefix, so old_string/new_string must contain only the real file text, never the line-number prefix.\n\
+         - Preserve the exact whitespace and indentation of the text as it appears in the file.\n\
+         - The edit FAILS if old_string is not unique: add more surrounding context to make it \
+         unique, or set replace_all to change every instance (e.g. to rename a variable).\n\
+         - Prefer the smallest old_string that is unambiguous (usually 2-4 adjacent lines).\n\
+         - For a change defined by code structure rather than exact text, use AstEdit instead."
     }
 
     fn is_dangerous(&self) -> bool {
