@@ -48,6 +48,14 @@ fn decode_text(bytes: &[u8]) -> String {
     }
 }
 
+/// 文件原本是否用 CRLF 换行 (任一处 `\r\n` 即判 CRLF)。用于 Edit 写回时保留原换行风格,
+/// 避免在 Windows 上把整文件的 CRLF 改成 LF (CC 行为: Edit 保留原 EOL)。
+pub fn file_is_crlf(path: &Path) -> bool {
+    fs::read(path)
+        .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+        .unwrap_or(false)
+}
+
 /// 文件 mtime, floor 到毫秒 (stale 检测主依据, 对照 CC `floor(mtimeMs)`)。
 pub fn mtime_ms(path: &Path) -> std::io::Result<i64> {
     let mt = fs::metadata(path)?.modified()?;

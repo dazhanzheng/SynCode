@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use syncode_core::file_state::FileState;
 use syncode_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
+/// 重复读未变文件时返回的存根 (逐字照搬 CC, 省 token)。
+const FILE_UNCHANGED_STUB: &str = "File unchanged since last read. The content from the earlier Read tool_result in this conversation is still current — refer to that instead of re-reading.";
+
 pub struct ReadTool;
 
 #[async_trait]
@@ -41,6 +44,17 @@ impl Tool for ReadTool {
         let path = PathBuf::from(file_path);
         let offset = args.get("offset").and_then(Value::as_u64);
         let limit = args.get("limit").and_then(Value::as_u64);
+
+        // dedup (省 token): 同窗口 + mtime 未变 → 返回存根, 不重发全文。
+        if let Some(cached) = ctx.files.get(&path) {
+            if !cached.is_partial_view
+                && cached.offset == offset
+                && cached.limit == limit
+                && fsutil::mtime_ms(&path).map(|m| m == cached.timestamp).unwrap_or(false)
+            {
+                return Ok(ToolOutput::ok(FILE_UNCHANGED_STUB));
+            }
+        }
 
         if path.is_dir() {
             return Err(ToolError::InvalidArgs(format!(

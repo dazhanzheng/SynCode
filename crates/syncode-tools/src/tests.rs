@@ -136,3 +136,32 @@ async fn grep_content_and_glob() {
         .unwrap();
     assert!(out2.content.contains("a.rs") && !out2.content.contains("b.txt"), "{}", out2.content);
 }
+
+#[tokio::test]
+async fn edit_preserves_crlf_line_endings() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("crlf.txt");
+    std::fs::write(&f, "alpha\r\nbeta\r\n").unwrap();
+    let ctx = ctx();
+    let fp = f.to_str().unwrap();
+    ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
+    EditTool
+        .call(json!({"file_path": fp, "old_string": "alpha", "new_string": "ALPHA"}), &ctx)
+        .await
+        .unwrap();
+    // CRLF 保留, 不被改成 LF。
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "ALPHA\r\nbeta\r\n");
+}
+
+#[tokio::test]
+async fn read_returns_dedup_stub_on_unchanged_reread() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("d.txt");
+    std::fs::write(&f, "content here").unwrap();
+    let ctx = ctx();
+    let fp = f.to_str().unwrap();
+    let first = ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
+    assert!(first.content.contains("content here"));
+    let second = ReadTool.call(json!({ "file_path": fp }), &ctx).await.unwrap();
+    assert!(second.content.contains("File unchanged since last read"), "{}", second.content);
+}

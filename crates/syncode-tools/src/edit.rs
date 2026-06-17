@@ -85,7 +85,13 @@ impl Tool for EditTool {
         } else {
             current.replacen(old_string, new_string, 1)
         };
-        fsutil::write_atomic(&path, &updated)
+        // 保留原文件换行风格: 原本 CRLF → 写回 CRLF (缓存仍存 LF 归一版供 stale 比较)。
+        let to_write = if fsutil::file_is_crlf(&path) {
+            updated.replace('\n', "\r\n")
+        } else {
+            updated.clone()
+        };
+        fsutil::write_atomic(&path, &to_write)
             .map_err(|e| ToolError::Exec(format!("write failed for {file_path}: {e}")))?;
 
         let mtime = fsutil::mtime_ms(&path).unwrap_or(0);
