@@ -131,6 +131,8 @@ impl Tool for AstEditTool {
                 is_partial_view: false,
             },
         );
+        // 落盘改动主动推给 LSP (若该文件已在某常驻服务器里打开)。
+        ctx.lsp.notify_file_changed(&path).await;
 
         Ok(ToolOutput::ok(format!(
             "The file {file_path} has been updated with {n} structural replacement{} (syntax verified).",

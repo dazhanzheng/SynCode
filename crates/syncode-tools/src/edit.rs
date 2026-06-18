@@ -129,6 +129,8 @@ impl Tool for EditTool {
                 is_partial_view: false,
             },
         );
+        // 落盘改动主动推给 LSP (若该文件已在某常驻服务器里打开), 保持索引与编辑同步。
+        ctx.lsp.notify_file_changed(&path).await;
         Ok(ToolOutput::ok(msg))
     }
 }
