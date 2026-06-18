@@ -1331,6 +1331,7 @@ dependencies = [
 name = "syncode-sandbox"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "thiserror",
  "windows-sys 0.61.2",
 ]

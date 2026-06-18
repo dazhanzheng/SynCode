@@ -62,17 +62,23 @@ impl Sandbox for NoopSandbox {
 
 /// 进程容器 (spawn-into-container 模型, 区别于 `Sandbox::apply` 的 exec-前-施加模型)。
 ///
-/// Windows: Job Object —— 把 spawn 出的进程塞进 job, **关 job handle 即杀整棵进程树**
-/// (`KILL_ON_JOB_CLOSE`), 外加活进程数 / 内存硬限。这是「跑模型给的命令」必须的底座:
-/// `cargo test` 会 spawn `rustc`/test 子进程, 朴素 kill 会留孤儿; job 杀的是整树 (§7.4)。
+/// - **Windows**: Job Object —— spawn 后把进程 assign 进 job, **关 job handle 即杀整树**
+///   (`KILL_ON_JOB_CLOSE`) + 活进程数/内存硬限。
+/// - **Unix**: 进程组 —— 调用方 spawn 前给命令设 `process_group(0)` 让子进程自成组长, 超时
+///   [`kill`](Self::kill) 时 `killpg(pgid, SIGKILL)` 杀整组 (Job Object 在 POSIX 的对位)。
+///   ⚠️ **仅编译期 (cross-target check) 验证, 运行时待真 Linux/macOS 验**。资源硬限 / 能力面隔离
+///   (cgroups/landlock/seccomp) 留给深度沙箱阶段。
 ///
-/// 其他平台: 暂为 no-op (Linux 后端将走 cgroups + 进程组, §7); 调用方对直接子进程仍可 kill 兜底。
+/// 这是「跑模型给的命令」必须的底座: `cargo test` 会 spawn `rustc`/test 子进程, 朴素 kill 会留孤儿;
+/// 容器杀的是整树 (§7.4)。
 ///
-/// 用法: 先 [`ProcessContainer::new`], spawn 进程后立刻 [`contain`](Self::contain) 其原生 handle,
-/// 超时/取消时 [`kill`](Self::kill) 整树; `Drop` 也会 (Windows) 杀树兜底。
+/// 用法: [`new`](Self::new) → spawn 后 [`contain`](Self::contain) (Windows 传 handle, Unix 传 pid)
+/// → 超时/取消时 [`kill`](Self::kill)。
 pub struct ProcessContainer {
     #[cfg(windows)]
     job: windows_backend::JobObject,
+    #[cfg(unix)]
+    pgid: std::sync::atomic::AtomicI32,
 }
 
 impl ProcessContainer {
@@ -84,32 +90,63 @@ impl ProcessContainer {
                 job: windows_backend::JobObject::new(policy)?,
             })
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            let _ = policy;
+            Ok(Self {
+                pgid: std::sync::atomic::AtomicI32::new(0),
+            })
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             let _ = policy;
             Ok(Self {})
         }
     }
 
-    /// 把一个已 spawn 的 OS 进程 (原生 handle, Windows 上即 `HANDLE`) 纳入容器。
-    /// 非 Windows 平台为 no-op。`handle` 以 `isize` 传递以保持跨平台签名一致。
-    pub fn contain(&self, handle: isize) -> Result<(), SandboxError> {
+    /// 把一个已 spawn 的进程纳入容器。Windows: 进程原生 `HANDLE`; Unix: 进程 `pid` (= 其进程组 pgid)。
+    /// `id` 以 `isize` 传递以保持跨平台签名一致。
+    pub fn contain(&self, id: isize) -> Result<(), SandboxError> {
         #[cfg(windows)]
         {
-            self.job.assign(handle)
+            self.job.assign(id)
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            let _ = handle;
+            self.pgid.store(id as i32, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = id;
             Ok(())
         }
     }
 
-    /// 杀掉容器内整棵进程树 (Windows: `TerminateJobObject`)。非 Windows 为 no-op。
+    /// 杀掉容器内整棵进程树。Windows: `TerminateJobObject`; Unix: `killpg(pgid, SIGKILL)`。
     pub fn kill(&self) {
         #[cfg(windows)]
         {
             self.job.kill();
+        }
+        #[cfg(unix)]
+        {
+            let pgid = self.pgid.load(std::sync::atomic::Ordering::SeqCst);
+            if pgid > 0 {
+                unix_backend::kill_group(pgid);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+mod unix_backend {
+    //! Unix 进程组杀树 (`killpg`)。⚠️ 仅编译期 cross-check 验证, 运行时待真机验。
+    /// 给整个进程组发 `SIGKILL` (子进程都已 `setpgid` 到同组, 故是杀整树)。
+    /// 进程已退则 `ESRCH`, 无害。
+    pub fn kill_group(pgid: i32) {
+        unsafe {
+            libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
         }
     }
 }

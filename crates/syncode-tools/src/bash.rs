@@ -83,8 +83,11 @@ impl Tool for BashTool {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Unix: 让子进程自成进程组组长, 供超时时 killpg 杀整组 (Windows 走 Job Object, 无此调用)。
+        #[cfg(unix)]
+        cmd.process_group(0);
 
-        // 进程容器 (Windows Job Object: 关 handle 即杀整树)。v1 不设进程/内存硬限 (免误伤 cargo)。
+        // 进程容器 (Windows Job Object / Unix 进程组)。v1 不设进程/内存硬限 (免误伤 cargo)。
         let container = ProcessContainer::new(&Policy::default())
             .map_err(|e| ToolError::Exec(format!("sandbox init failed: {e}")))?;
 
@@ -92,10 +95,14 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| ToolError::Exec(format!("failed to spawn command: {e}")))?;
 
-        // spawn 后尽快纳入容器 (Windows)。
+        // spawn 后尽快纳入容器: Windows 传进程 HANDLE, Unix 传 pid (= pgid)。
         #[cfg(windows)]
         if let Some(handle) = child.raw_handle() {
             let _ = container.contain(handle as isize);
+        }
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            let _ = container.contain(pid as isize);
         }
 
         let mut stdout = child.stdout.take().expect("piped stdout");
