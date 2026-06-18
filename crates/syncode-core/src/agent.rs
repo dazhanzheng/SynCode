@@ -191,9 +191,20 @@ impl AgentLoop {
             }
         };
         // 危险工具走审批 (§7)。当前粗粒度按 ArbitraryExec; 后续按工具语义细分 ActionClass。
-        if tool.is_dangerous() && self.approver.decide(&ActionClass::ArbitraryExec) == Decision::Deny
-        {
-            return format!("<tool_use_error>permission denied for {name}</tool_use_error>");
+        // **穷举 match (无通配)**: Ask 在没有人类审批通道前 fail-closed —— 绝不静默放行
+        // (否则接入真审批器时 Ask 会塌成 Allow, 任意命令无提示执行, 破坏放权底座)。
+        if tool.is_dangerous() {
+            match self.approver.decide(&ActionClass::ArbitraryExec) {
+                Decision::Allow => {}
+                Decision::Deny => {
+                    return format!("<tool_use_error>permission denied for {name}</tool_use_error>");
+                }
+                Decision::Ask => {
+                    return format!(
+                        "<tool_use_error>{name} requires human approval, which is not wired up yet; refusing to execute</tool_use_error>"
+                    );
+                }
+            }
         }
         let ctx = ToolCtx::with_lsp(
             self.files.clone(),
@@ -275,6 +286,47 @@ mod tests {
         let agent = AgentLoop::new(dummy_client(), registry_with(Arc::new(EchoTool)));
         let out = agent.dispatch_tool(&call("echo", r#"{"text":"hi"}"#)).await;
         assert_eq!(out, "echo: hi");
+    }
+
+    struct DangerTool(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait]
+    impl Tool for DangerTool {
+        fn name(&self) -> &str {
+            "danger"
+        }
+        fn description(&self) -> &str {
+            "a dangerous tool"
+        }
+        fn is_dangerous(&self) -> bool {
+            true
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{},"additionalProperties":false})
+        }
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput::ok("ran"))
+        }
+    }
+
+    struct AskAll;
+    impl crate::permission::Approver for AskAll {
+        fn decide(&self, _a: &crate::permission::ActionClass) -> crate::permission::Decision {
+            crate::permission::Decision::Ask
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_decision_fails_closed_and_does_not_execute() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let agent = AgentLoop::new(dummy_client(), registry_with(Arc::new(DangerTool(ran.clone()))))
+            .with_approver(Arc::new(AskAll));
+        let out = agent.dispatch_tool(&call("danger", "{}")).await;
+        assert!(out.contains("requires human approval"), "got: {out}");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "dangerous tool must NOT execute on Ask"
+        );
     }
 
     #[tokio::test]

@@ -349,6 +349,24 @@ async fn bash_timeout_kills_the_process_tree() {
     assert!(out.content.contains("timed out"), "{}", out.content);
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_scrubs_parent_env_keeps_essentials() {
+    let ctx = ctx();
+    // USERNAME 总在父进程 env, 但不在白名单 → 子进程拿不到 → cmd 不展开, 原样回显 %USERNAME%。
+    let out = BashTool
+        .call(json!({ "command": "echo user=[%USERNAME%]" }), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.contains("%USERNAME%"), "env not scrubbed: {}", out.content);
+    // PATH 在白名单 → 被回填 → cmd 能展开 (不原样输出 %PATH%)。
+    let out2 = BashTool
+        .call(json!({ "command": "echo path=[%PATH%]" }), &ctx)
+        .await
+        .unwrap();
+    assert!(!out2.content.contains("%PATH%"), "PATH should be allowlisted: {}", out2.content);
+}
+
 #[tokio::test]
 async fn lsp_rejects_non_rust_file() {
     let dir = tempfile::tempdir().unwrap();
