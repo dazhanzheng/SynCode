@@ -1332,6 +1332,7 @@ name = "syncode-sandbox"
 version = "0.0.0"
 dependencies = [
  "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1345,6 +1346,7 @@ dependencies = [
  "syncode-ast",
  "syncode-core",
  "syncode-lsp",
+ "syncode-sandbox",
  "tempfile",
  "tokio",
 ]

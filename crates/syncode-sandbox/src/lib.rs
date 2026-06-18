@@ -60,15 +60,138 @@ impl Sandbox for NoopSandbox {
     }
 }
 
-// 平台后端 (TODO): 各写一个, 或砍成 Linux-only (见 §5.1 可移植税)。
-#[cfg(target_os = "linux")]
-pub mod linux {
-    //! landlock + seccompiler + namespaces 后端 (TODO, §4/§7)。
+/// 进程容器 (spawn-into-container 模型, 区别于 `Sandbox::apply` 的 exec-前-施加模型)。
+///
+/// Windows: Job Object —— 把 spawn 出的进程塞进 job, **关 job handle 即杀整棵进程树**
+/// (`KILL_ON_JOB_CLOSE`), 外加活进程数 / 内存硬限。这是「跑模型给的命令」必须的底座:
+/// `cargo test` 会 spawn `rustc`/test 子进程, 朴素 kill 会留孤儿; job 杀的是整树 (§7.4)。
+///
+/// 其他平台: 暂为 no-op (Linux 后端将走 cgroups + 进程组, §7); 调用方对直接子进程仍可 kill 兜底。
+///
+/// 用法: 先 [`ProcessContainer::new`], spawn 进程后立刻 [`contain`](Self::contain) 其原生 handle,
+/// 超时/取消时 [`kill`](Self::kill) 整树; `Drop` 也会 (Windows) 杀树兜底。
+pub struct ProcessContainer {
+    #[cfg(windows)]
+    job: windows_backend::JobObject,
+}
+
+impl ProcessContainer {
+    /// 按 `policy` 的资源硬限建一个容器。
+    pub fn new(policy: &Policy) -> Result<Self, SandboxError> {
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                job: windows_backend::JobObject::new(policy)?,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = policy;
+            Ok(Self {})
+        }
+    }
+
+    /// 把一个已 spawn 的 OS 进程 (原生 handle, Windows 上即 `HANDLE`) 纳入容器。
+    /// 非 Windows 平台为 no-op。`handle` 以 `isize` 传递以保持跨平台签名一致。
+    pub fn contain(&self, handle: isize) -> Result<(), SandboxError> {
+        #[cfg(windows)]
+        {
+            self.job.assign(handle)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = handle;
+            Ok(())
+        }
+    }
+
+    /// 杀掉容器内整棵进程树 (Windows: `TerminateJobObject`)。非 Windows 为 no-op。
+    pub fn kill(&self) {
+        #[cfg(windows)]
+        {
+            self.job.kill();
+        }
+    }
 }
 
 #[cfg(windows)]
 pub mod windows_backend {
-    //! Job Objects + 受限令牌后端 (TODO, §4/§7)。
+    //! Job Object 真实实现 (windows-sys FFI, §4/§7)。
+    use super::{Policy, SandboxError};
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct JobObject {
+        handle: *mut c_void,
+    }
+    // job handle 仅由本结构独占持有, 跨线程移动安全。
+    unsafe impl Send for JobObject {}
+    unsafe impl Sync for JobObject {}
+
+    impl JobObject {
+        pub fn new(policy: &Policy) -> Result<Self, SandboxError> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(SandboxError::Apply("CreateJobObjectW failed".into()));
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            // 关 job 即杀整树 —— 容器消亡时不留孤儿。
+            let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if let Some(max) = policy.max_processes {
+                info.BasicLimitInformation.ActiveProcessLimit = max;
+                flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            }
+            if let Some(mem) = policy.max_memory_bytes {
+                info.JobMemoryLimit = mem as usize;
+                flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            }
+            info.BasicLimitInformation.LimitFlags = flags;
+            let ok = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                unsafe { CloseHandle(handle) };
+                return Err(SandboxError::Apply("SetInformationJobObject failed".into()));
+            }
+            Ok(Self { handle })
+        }
+
+        pub fn assign(&self, process: isize) -> Result<(), SandboxError> {
+            let ok = unsafe { AssignProcessToJobObject(self.handle, process as *mut c_void) };
+            if ok == 0 {
+                return Err(SandboxError::Apply("AssignProcessToJobObject failed".into()));
+            }
+            Ok(())
+        }
+
+        pub fn kill(&self) {
+            unsafe { TerminateJobObject(self.handle, 1) };
+        }
+    }
+
+    impl Drop for JobObject {
+        fn drop(&mut self) {
+            // KILL_ON_JOB_CLOSE: 关 handle 即杀整树, 兜底防孤儿。
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
+// 平台后端 (TODO): 各写一个, 或砍成 Linux-only (见 §5.1 可移植税)。
+#[cfg(target_os = "linux")]
+pub mod linux {
+    //! landlock + seccompiler + namespaces 后端 (TODO, §4/§7)。
 }
 
 #[cfg(target_os = "macos")]

@@ -12,6 +12,7 @@ async-trait = { workspace = true }
 syncode-core = { workspace = true }
 syncode-ast = { workspace = true }
 syncode-lsp = { workspace = true }
+syncode-sandbox = { workspace = true }
 tempfile = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }

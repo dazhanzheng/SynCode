@@ -1,6 +1,6 @@
 //! 文件工具集成测试: 验证 Read/Write/Edit/Grep 的契约 + 共享缓存联动 (必先读 / stale / 原子写)。
 
-use crate::{AstEditTool, AstGrepTool, EditTool, GrepTool, LspTool, ReadTool, WriteTool};
+use crate::{AstEditTool, AstGrepTool, BashTool, EditTool, GrepTool, LspTool, ReadTool, WriteTool};
 use serde_json::json;
 use std::sync::Arc;
 use syncode_core::tool::{Tool, ToolCtx};
@@ -315,6 +315,38 @@ async fn lsp_documentsymbol_via_tool() {
         .unwrap();
     assert!(!out.is_error, "{}", out.content);
     assert!(out.content.contains("alpha") && out.content.contains("Beta"), "{}", out.content);
+}
+
+// ---- Bash (跑命令 + 进程容器) ----
+
+#[tokio::test]
+async fn bash_runs_command_and_captures_output() {
+    let ctx = ctx();
+    let out = BashTool
+        .call(json!({ "command": "echo hello-from-bash" }), &ctx)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("hello-from-bash"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn bash_reports_nonzero_exit_code() {
+    let ctx = ctx();
+    let out = BashTool.call(json!({ "command": "exit 3" }), &ctx).await.unwrap();
+    assert!(out.content.contains("exit code 3"), "{}", out.content);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_timeout_kills_the_process_tree() {
+    let ctx = ctx();
+    // ping -n 5 ≈ 4s; timeout 500ms 必触发 → 容器杀整树。
+    let out = BashTool
+        .call(json!({ "command": "ping -n 5 127.0.0.1 >nul", "timeout_ms": 500 }), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.contains("timed out"), "{}", out.content);
 }
 
 #[tokio::test]
