@@ -351,6 +351,28 @@ async fn bash_timeout_kills_the_process_tree() {
 
 #[cfg(windows)]
 #[tokio::test]
+#[ignore = "invokes rustc; slow; verifies the scrubbed env can still build Rust"]
+async fn bash_can_compile_and_run_rust_under_scrubbed_env() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hello.rs"),
+        "fn main() { let s: i32 = (1..=10).sum(); println!(\"sum={s}\"); }",
+    )
+    .unwrap();
+    let ctx = ToolCtx::new(Arc::new(FileStateCache::new()), dir.path().to_path_buf());
+    // 关键: env 被 scrub 后, rustc 还能不能找到 MSVC linker 并编译+运行?
+    let out = BashTool
+        .call(
+            json!({ "command": "rustc hello.rs -o hello.exe && hello.exe", "timeout_ms": 120000 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(out.content.contains("sum=55"), "build/run under scrubbed env failed:\n{}", out.content);
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn bash_scrubs_parent_env_keeps_essentials() {
     let ctx = ctx();
     // USERNAME 总在父进程 env, 但不在白名单 → 子进程拿不到 → cmd 不展开, 原样回显 %USERNAME%。

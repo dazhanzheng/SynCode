@@ -159,10 +159,15 @@ fn scrub_env(cmd: &mut Command) {
         cmd.env("PATH", p);
     }
     let essentials: &[&str] = if cfg!(windows) {
-        // cmd.exe 起不来若缺 SystemRoot/ComSpec/PATHEXT。
         &[
-            "SystemRoot", "windir", "TEMP", "TMP", "USERPROFILE", "ComSpec", "PATHEXT",
-            "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+            // cmd.exe 起不来若缺这些。
+            "SystemRoot", "windir", "ComSpec", "PATHEXT", "NUMBER_OF_PROCESSORS",
+            "PROCESSOR_ARCHITECTURE",
+            // 临时目录 + 用户目录。
+            "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "APPDATA",
+            // **工具链发现**: rustc/cc 靠 vswhere 找 MSVC linker, vswhere 在 %ProgramFiles(x86)%;
+            // 缺这些则 `link.exe not found` —— 不是机密, 必须放行 (实证教训)。
+            "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData",
         ]
     } else {
         &["HOME", "TMPDIR", "LANG", "LC_ALL", "USER"]
