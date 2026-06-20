@@ -1,0 +1,22 @@
+# SynCode UI — gpui / gpui-component 验证 spike (架构 §9 / §12 待验证: gpui-component 在 Windows 的真实构建)。
+# **自成独立 workspace** (与主 workspace 隔离): gpui 拉 Zed 单仓 git 依赖 (多 GB) + 巨依赖树, 不该污染主构建。
+# 依赖 rev 必须**对齐** gpui-component 当前 pin 的 zed rev, 否则会编出两个互不兼容的 gpui crate。
+[package]
+name = "syncode-ui"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+# zed rev 取自 gpui-component main 的 [workspace.dependencies] (2026-06 读取); 与 gpui-component 对齐。
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+
+# gpui 历史上需要 psm 的 git 版本 (栈管理); 沿用 gpui-component 的同款 patch。
+[patch.crates-io]
+psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
