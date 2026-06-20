@@ -17,6 +17,14 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac10
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 
+# SynCode agent 栈 (path 依赖主 workspace 的 crate); 跑真 agent loop + 流式事件。
+syncode-core = { path = "../syncode-core" }
+syncode-llm = { path = "../syncode-llm" }
+syncode-tools = { path = "../syncode-tools" }
+# agent worker 跑在独立 tokio runtime 线程; UI↔worker 用 smol channel (运行时无关, gpui executor 可 await)。
+tokio = { version = "1", features = ["rt-multi-thread"] }
+smol = "2"
+
 # gpui 历史上需要 psm 的 git 版本 (栈管理); 沿用 gpui-component 的同款 patch。
 [patch.crates-io]
 psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
