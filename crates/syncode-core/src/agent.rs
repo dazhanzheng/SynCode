@@ -26,6 +26,25 @@ use syncode_llm::wire::{
     ToolCall,
 };
 
+/// agent loop 跑动时发出的进度事件 (供 UI 流式渲染)。回调式投递 (core 不绑定具体 channel):
+/// UI 用 [`with_event_sink`](AgentLoop::with_event_sink) 注入一个闭包, 把事件推进自己的通道。
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// 模型本轮可见文本 (assistant content)。
+    AssistantText(String),
+    /// 模型本轮有推理 (CoT); 只报字符数, 不传全文。
+    Reasoning { chars: usize },
+    /// 一个工具即将执行。
+    ToolStarted { name: String, args: String },
+    /// 工具返回 (结果预览, 截断)。
+    ToolFinished { name: String, preview: String, is_error: bool },
+    /// turn 正常结束。
+    TurnDone,
+}
+
+/// 事件回调汇 (在 agent 的 async 上下文里**同步**调用; 实现应是非阻塞的, 如往 channel 投递)。
+pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
 /// 一个 turn 的自建循环: 投影裁切 → 请求 → 若 `tool_calls` 则分发执行 → 回填 → 直到 `stop`。
 pub struct AgentLoop {
     client: Arc<DeepSeekClient>,
@@ -43,6 +62,8 @@ pub struct AgentLoop {
     /// 授权项目根 = 工具 cwd 的**单一真相** (review fix #14): 与 approver / fs-scope 同一值, 别每次
     /// dispatch 重读 `std::env::current_dir()` (那会与两闸钉死的根漂移)。
     cwd: PathBuf,
+    /// 可选进度事件汇 (UI 流式渲染)。无则不发事件 (headless / 测试)。
+    events: Option<EventSink>,
     /// 可选持久化 (D2/D4)。无则纯内存。
     store: Option<SessionStore>,
     session_id: String,
@@ -60,6 +81,7 @@ impl AgentLoop {
             fs: None,
             background: Arc::new(BackgroundRegistry::new()),
             cwd: std::env::current_dir().unwrap_or_default(),
+            events: None,
             store: None,
             session_id: "default".to_string(),
         }
@@ -68,6 +90,19 @@ impl AgentLoop {
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = approver;
         self
+    }
+
+    /// 注入进度事件汇 (UI 流式渲染): 每段 assistant 文本 / 每次工具起止都会回调一次。
+    pub fn with_event_sink(mut self, sink: EventSink) -> Self {
+        self.events = Some(sink);
+        self
+    }
+
+    /// 发一个进度事件 (无汇则 no-op)。
+    fn emit(&self, event: AgentEvent) {
+        if let Some(sink) = &self.events {
+            sink(event);
+        }
     }
 
     /// 挂上文件写收容守卫 (P1c): 写类工具落盘前校验路径在授权根内。
@@ -177,7 +212,14 @@ impl AgentLoop {
             // assistant 全文 (含完整 reasoning_content) 回填 canonical。裁切只在发送投影侧做 (D1)。
             let tool_calls = message.tool_calls.clone().unwrap_or_default();
             let content = message.content.clone().unwrap_or_default();
+            let reasoning_chars = message.reasoning_content.as_deref().map(str::len).unwrap_or(0);
             self.commit(session, message);
+            if reasoning_chars > 0 {
+                self.emit(AgentEvent::Reasoning { chars: reasoning_chars });
+            }
+            if !content.trim().is_empty() {
+                self.emit(AgentEvent::AssistantText(content.clone()));
+            }
 
             if finish == Some(FinishReason::ToolCalls) && !tool_calls.is_empty() {
                 // 并行工具调用: 一轮可有多个 tool_calls, 逐个执行并回填结果 (§11)。
@@ -198,13 +240,24 @@ impl AgentLoop {
                 }
             }
 
+            self.emit(AgentEvent::TurnDone);
             return Ok(()); // Stop / Length / ContentFilter → turn 结束
         }
     }
 
+    /// 分发一次工具调用 (含进度事件): 包裹 [`dispatch_inner`](Self::dispatch_inner), 起止各发一个事件。
+    async fn dispatch_tool(&self, tc: &ToolCall) -> String {
+        let name = tc.function.name.clone();
+        self.emit(AgentEvent::ToolStarted { name: name.clone(), args: tc.function.arguments.clone() });
+        let result = self.dispatch_inner(tc).await;
+        let is_error = result.starts_with("<tool_use_error>");
+        self.emit(AgentEvent::ToolFinished { name, preview: preview_str(&result), is_error });
+        result
+    }
+
     /// 分发一次工具调用, 返回回给模型的结果字符串。
     /// error message 写给模型读 (借鉴 CC `<tool_use_error>` 包裹, 利于自纠偏 §10)。
-    async fn dispatch_tool(&self, tc: &ToolCall) -> String {
+    async fn dispatch_inner(&self, tc: &ToolCall) -> String {
         let name = tc.function.name.as_str();
         let Some(tool) = self.tools.get(name) else {
             return format!("<tool_use_error>No such tool available: {name}</tool_use_error>");
@@ -270,6 +323,17 @@ fn detect_leaked_tool_call(content: &str, tools: &ToolRegistry) -> Option<ToolCa
     })
 }
 
+/// 工具结果预览 (UI 进度事件用): 截到 ~300 字符, 保 char 边界。
+fn preview_str(s: &str) -> String {
+    const MAX: usize = 300;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(MAX).collect();
+        format!("{t}…")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +381,23 @@ mod tests {
         let agent = AgentLoop::new(dummy_client(), registry_with(Arc::new(EchoTool)));
         let out = agent.dispatch_tool(&call("echo", r#"{"text":"hi"}"#)).await;
         assert_eq!(out, "echo: hi");
+    }
+
+    #[tokio::test]
+    async fn event_sink_emits_tool_started_and_finished() {
+        use std::sync::Mutex;
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let agent = AgentLoop::new(dummy_client(), registry_with(Arc::new(EchoTool)))
+            .with_event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)));
+        let out = agent.dispatch_tool(&call("echo", r#"{"text":"hi"}"#)).await;
+        assert_eq!(out, "echo: hi");
+        let evs = events.lock().unwrap();
+        assert!(matches!(evs.first(), Some(AgentEvent::ToolStarted { .. })), "{evs:?}");
+        assert!(
+            matches!(evs.last(), Some(AgentEvent::ToolFinished { is_error: false, .. })),
+            "{evs:?}"
+        );
     }
 
     /// 测试工具: 把自己分类成指定 [`ActionClass`], call 时翻 ran 标记 —— 验证审批闸是否真挡住执行。
