@@ -37,7 +37,9 @@ enum WorkerMsg {
 enum Line {
     User(String),
     Assistant(String),
-    Tool { name: String, ok: bool, detail: String },
+    /// 一次工具调用 (一行, 可折叠): `args` 完整, `result` 在 finish 前为 None (运行中)。
+    /// 折叠时显示 name + 结果摘要; 展开 (`expanded`) 显示完整 args + result。
+    Tool { name: String, args: String, result: Option<String>, ok: bool, expanded: bool },
     Reasoning(usize),
     Status(String),
 }
@@ -99,10 +101,19 @@ impl AgentApp {
             AgentEvent::AssistantText(t) => self.lines.push(Line::Assistant(t)),
             AgentEvent::Reasoning { chars } => self.lines.push(Line::Reasoning(chars)),
             AgentEvent::ToolStarted { name, args } => {
-                self.lines.push(Line::Tool { name, ok: true, detail: truncate(&args, 100) })
+                self.lines.push(Line::Tool { name, args, result: None, ok: true, expanded: false })
             }
-            AgentEvent::ToolFinished { name, preview, is_error } => {
-                self.lines.push(Line::Tool { name, ok: !is_error, detail: truncate(&preview, 160) })
+            AgentEvent::ToolFinished { result, is_error, .. } => {
+                // dispatch 串行 (Started→Finished 严格配对): 回填最近一个未完成的 Tool 行。
+                if let Some(Line::Tool { result: slot, ok, .. }) = self
+                    .lines
+                    .iter_mut()
+                    .rev()
+                    .find(|l| matches!(l, Line::Tool { result: None, .. }))
+                {
+                    *slot = Some(result);
+                    *ok = !is_error;
+                }
             }
             AgentEvent::TurnDone => {
                 self.lines.push(Line::Status("— done —".into()));
@@ -143,9 +154,10 @@ impl AgentApp {
         let (label, body, color) = match line {
             Line::User(t) => ("you", t.clone(), theme.primary),
             Line::Assistant(t) => ("syncode", t.clone(), theme.foreground),
-            Line::Tool { name, ok, detail } => (
+            // Tool 实际走 render_tool (可折叠); 此分支仅为 match 完备的兜底, 不会被渲染调用命中。
+            Line::Tool { name, ok, result, .. } => (
                 if *ok { "tool" } else { "tool!" },
-                format!("{name}  {detail}"),
+                format!("{name}  {}", result.as_deref().unwrap_or("…")),
                 if *ok { theme.muted_foreground } else { theme.danger },
             ),
             Line::Reasoning(n) => ("think", format!("(reasoning: {n} chars)"), theme.muted_foreground),
@@ -157,13 +169,88 @@ impl AgentApp {
             .child(div().w(px(64.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(label))
             .child(div().flex_1().text_sm().text_color(color).child(body))
     }
+
+    /// 可折叠工具行: 可点击 header (▸/▾ + name + 结果摘要); 展开时在下方显示完整 args + result。
+    /// `i` = 该行在 `self.lines` 的下标, 点击经 `cx.listener` 翻转该行的 `expanded`。
+    fn render_tool(
+        &self,
+        i: usize,
+        name: &str,
+        args: &str,
+        result: Option<&str>,
+        ok: bool,
+        expanded: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let color = if ok { theme.muted_foreground } else { theme.danger };
+        let glyph = if expanded { "▾" } else { "▸" };
+        let label = if ok { "tool" } else { "tool!" };
+        let summary = match result {
+            Some(r) => truncate(r, 120),
+            None => "running…".to_string(),
+        };
+
+        let header = h_flex()
+            .id(("tool", i))
+            .gap_2()
+            .items_start()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _ev, _window, cx| {
+                if let Some(Line::Tool { expanded, .. }) = this.lines.get_mut(i) {
+                    *expanded = !*expanded;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .w(px(64.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("{glyph} {label}")),
+            )
+            .child(div().flex_1().text_sm().text_color(color).child(format!("{name}  {summary}")));
+
+        let mut col = v_flex().gap_1().child(header);
+        if expanded {
+            col = col.child(
+                div()
+                    .pl(px(72.))
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("args: {args}")),
+            );
+            if let Some(r) = result {
+                col = col.child(
+                    div()
+                        .pl(px(72.))
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(format!("result:\n{r}")),
+                );
+            }
+        }
+        col
+    }
 }
 
 impl Render for AgentApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let running = self.running;
-        let rows: Vec<_> = self.lines.iter().map(|l| self.render_line(l, cx)).collect();
+        // Tool 行走可折叠的 render_tool (需下标做点击 id/toggle); 其余走 render_line。
+        let rows: Vec<AnyElement> = self
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| match l {
+                Line::Tool { name, args, result, ok, expanded } => self
+                    .render_tool(i, name, args, result.as_deref(), *ok, *expanded, cx)
+                    .into_any_element(),
+                other => self.render_line(other, cx).into_any_element(),
+            })
+            .collect();
 
         v_flex()
             .size_full()

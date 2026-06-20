@@ -36,8 +36,8 @@ pub enum AgentEvent {
     Reasoning { chars: usize },
     /// 一个工具即将执行。
     ToolStarted { name: String, args: String },
-    /// 工具返回 (结果预览, 截断)。
-    ToolFinished { name: String, preview: String, is_error: bool },
+    /// 工具返回 (完整结果文本; UI 自行决定折叠/截断展示)。
+    ToolFinished { name: String, result: String, is_error: bool },
     /// turn 正常结束。
     TurnDone,
 }
@@ -251,7 +251,7 @@ impl AgentLoop {
         self.emit(AgentEvent::ToolStarted { name: name.clone(), args: tc.function.arguments.clone() });
         let result = self.dispatch_inner(tc).await;
         let is_error = result.starts_with("<tool_use_error>");
-        self.emit(AgentEvent::ToolFinished { name, preview: preview_str(&result), is_error });
+        self.emit(AgentEvent::ToolFinished { name, result: result.clone(), is_error });
         result
     }
 
@@ -321,17 +321,6 @@ fn detect_leaked_tool_call(content: &str, tools: &ToolRegistry) -> Option<ToolCa
         kind: "function".to_string(),
         function: FunctionCall { name: name.to_string(), arguments },
     })
-}
-
-/// 工具结果预览 (UI 进度事件用): 截到 ~300 字符, 保 char 边界。
-fn preview_str(s: &str) -> String {
-    const MAX: usize = 300;
-    if s.chars().count() <= MAX {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(MAX).collect();
-        format!("{t}…")
-    }
 }
 
 #[cfg(test)]
