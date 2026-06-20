@@ -8,6 +8,7 @@
 //! 本 MVP 用一个按钮跑**只读**演示任务 (不改仓库, 安全); 文本输入框留作下一步。
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
@@ -24,14 +25,21 @@ use syncode_tools::register_builtins;
 const DEMO_TASK: &str = "Read the file crates/syncode-core/src/tool.rs and briefly summarize what \
     the `Tool` trait requires implementors to provide. Be concise.";
 
-/// agent worker 的 system prompt (常驻 session 起头, 固定在前缀以吃 prompt cache, §12)。
-const SYSTEM_PROMPT: &str = "You are SynCode, an autonomous coding agent in a Rust workspace. Use \
-    absolute paths. Locate code with Grep/Read before answering. Be concise.";
-
-/// UI → worker 的控制消息。Task 跑一轮 (累积进常驻 session); Reset 丢弃 session 开新会话。
+/// UI → worker 的控制消息。Task 跑一轮 (累积进常驻 session); Reset 丢弃 session 开新会话;
+/// SetWorkspace 把 agent 的项目根 (cwd / 审批写根 / FsScope 收容根) 切到新目录并重建 + 开新会话。
 enum WorkerMsg {
     Task(String),
     Reset,
+    SetWorkspace(PathBuf),
+}
+
+/// agent 的 system prompt: 含当前项目根, 让模型知道自己在哪个 workspace 工作。
+fn system_prompt(root: &Path) -> String {
+    format!(
+        "You are SynCode, an autonomous coding agent. The current project workspace is {}. Use \
+         absolute paths. Locate code with Grep/Read before answering. Be concise.",
+        root.display()
+    )
 }
 
 /// 交互审批请求 (worker → UI): 当策略审批器判 `Ask` 时, AskGate 把它发给 UI 并 await `reply`。
@@ -61,6 +69,8 @@ struct AgentApp {
     lines: Vec<Line>,
     input: Entity<InputState>,
     task_tx: smol::channel::Sender<WorkerMsg>,
+    /// 当前 workspace (agent 操作的项目根); 顶栏展示、可经 Open folder 切换。
+    workspace: PathBuf,
     /// 在途审批请求 (Some 时渲染审批卡片, 阻塞 agent 直到人点 Allow/Deny)。
     pending_approval: Option<ApprovalRequest>,
     running: bool,
@@ -119,6 +129,8 @@ impl AgentApp {
             lines: vec![Line::Status("Ready — edit the task and press Enter (or Send).".into())],
             input,
             task_tx,
+            // 初始 workspace = 进程 cwd, 与 worker 启动时取的根一致。
+            workspace: std::env::current_dir().unwrap_or_default(),
             pending_approval: None,
             running: false,
             scroll: ScrollHandle::new(),
@@ -191,6 +203,36 @@ impl AgentApp {
         }
         let _ = self.task_tx.try_send(WorkerMsg::Reset);
         self.lines = vec![Line::Status("New chat — context cleared.".into())];
+        cx.notify();
+    }
+
+    /// 弹原生「选文件夹」对话框, 选中后把 workspace 切到该目录。idle 时才可点 (render 已 disable)。
+    fn open_workspace(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose workspace folder".into()),
+        });
+        cx.spawn(async move |weak, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = weak.update(cx, |this, cx| this.set_workspace(path, cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 切 workspace: 通知 worker 重建 agent (新根 = cwd / 审批写根 / FsScope), 清空 transcript 开新会话。
+    fn set_workspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let _ = self.task_tx.try_send(WorkerMsg::SetWorkspace(path.clone()));
+        self.lines =
+            vec![Line::Status(format!("Workspace → {} · context cleared.", path.display()))];
+        self.workspace = path;
         cx.notify();
     }
 
@@ -504,23 +546,34 @@ impl AgentApp {
             .child(
                 v_flex()
                     .child(div().text_lg().font_bold().text_color(theme.foreground).child("SynCode"))
+                    // 副标题 = 当前 workspace 路径 (尾部优先, 太长则前缀省略)。
                     .child(
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("autonomous coding agent"),
+                            .child(format!("📁 {}", short_path(&self.workspace))),
                     ),
             )
             .child(
                 h_flex()
-                    .gap_3()
+                    .gap_2()
                     .items_center()
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
+                            .mr_1()
                             .child(div().size(px(8.)).rounded_full().bg(dot))
                             .child(div().text_xs().text_color(theme.muted_foreground).child(status)),
+                    )
+                    .child(
+                        Button::new("open-folder")
+                            .ghost()
+                            .label("Open folder…")
+                            .disabled(running)
+                            .on_click(
+                                cx.listener(|this, _ev, window, cx| this.open_workspace(window, cx)),
+                            ),
                     )
                     .child(
                         Button::new("new-chat")
@@ -611,6 +664,19 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// 路径短展示: 太长时保留**尾部** (更有信息量), 前面用 `…` 省略。
+fn short_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    let n = s.chars().count();
+    const MAX: usize = 56;
+    if n <= MAX {
+        s
+    } else {
+        let tail: String = s.chars().skip(n - (MAX - 1)).collect();
+        format!("…{tail}")
+    }
+}
+
 /// agent worker: 独立线程 + tokio runtime; 持一个**常驻 session** 跨任务累积上下文 (多轮)。
 /// 收到 `Task` 就把它 push 进 session 跑一个 turn; 收到 `Reset` 丢弃 session 开新会话。
 fn run_agent_worker(
@@ -650,9 +716,7 @@ fn run_agent_worker(
                 return;
             }
         };
-        let mut registry = ToolRegistry::new();
-        register_builtins(&mut registry);
-        let root = std::env::current_dir().unwrap_or_default();
+        let client = Arc::new(client);
         let sink_tx = event_tx.clone();
         let sink: EventSink = Arc::new(move |e| {
             let _ = sink_tx.try_send(e);
@@ -669,19 +733,32 @@ fn run_agent_worker(
             });
             fut
         });
-        let mut agent = AgentLoop::new(Arc::new(client), registry)
-            .with_approver(Arc::new(PolicyApprover::new(&root)))
-            .with_fs_scope(Some(Arc::new(FsScope::new(&root))))
-            .with_cwd(&root)
-            .with_event_sink(sink)
-            .with_ask_gate(gate);
+        // 给定根造一个 AgentLoop: cwd / 审批写根 / FsScope 收容根都钉在该根 (单一真相 #14)。
+        // 切 workspace 时整体重建 (新根 = 新 PolicyApprover / FsScope / cwd; 工具缓存 / LSP 也重置)。
+        let make_agent = |root: &Path| -> AgentLoop {
+            let mut registry = ToolRegistry::new();
+            register_builtins(&mut registry);
+            AgentLoop::new(client.clone(), registry)
+                .with_approver(Arc::new(PolicyApprover::new(root)))
+                .with_fs_scope(Some(Arc::new(FsScope::new(root))))
+                .with_cwd(root)
+                .with_event_sink(sink.clone())
+                .with_ask_gate(gate.clone())
+        };
 
-        // 常驻 session: 循环外建一次, 跨任务累积 (多轮上下文)。Reset 时整体重建。
-        let mut session = Session::with_system(SYSTEM_PROMPT);
+        let mut root = std::env::current_dir().unwrap_or_default();
+        let mut agent = make_agent(&root);
+        // 常驻 session: 跨任务累积 (多轮)。Reset / 切 workspace 时整体重建。
+        let mut session = Session::with_system(system_prompt(&root));
         while let Ok(msg) = task_rx.recv().await {
             match msg {
                 WorkerMsg::Reset => {
-                    session = Session::with_system(SYSTEM_PROMPT);
+                    session = Session::with_system(system_prompt(&root));
+                }
+                WorkerMsg::SetWorkspace(path) => {
+                    root = path;
+                    agent = make_agent(&root); // 重建: 新根钉进两闸 + cwd
+                    session = Session::with_system(system_prompt(&root));
                 }
                 WorkerMsg::Task(task) => {
                     session.push_user(&task);
