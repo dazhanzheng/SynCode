@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use syncode_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
+use syncode_lsp::lang::{lang_for_extension, lang_for_path, workspace_root_for};
 use syncode_lsp::{path_to_file_uri, uri_to_path};
 
 /// 索引就绪等待上限 (serverStatus 正常时通常秒级返回; 这是上限不是常态)。
@@ -41,7 +42,9 @@ impl Tool for LspTool {
          character; documentSymbol/diagnostics need only file_path; workspaceSymbol needs `query`.\n\
          - An empty result for a position op usually means the cursor is not on a symbol — recheck \
          line/character. If the tool says the server is still indexing, just retry.\n\
-         - v1 supports Rust (.rs) via rust-analyzer; the server starts and indexes on first use."
+         - Language is chosen by file extension: Rust (rust-analyzer), Go (gopls), Python (pyright), \
+         TypeScript/JavaScript (typescript-language-server), C/C++ (clangd). The matching server must \
+         be installed and on PATH; it starts and indexes on first use."
     }
 
     fn parameters(&self) -> Value {
@@ -76,13 +79,20 @@ impl Tool for LspTool {
                 .get("query")
                 .and_then(Value::as_str)
                 .ok_or_else(|| ToolError::InvalidArgs("query is required for workspaceSymbol".into()))?;
-            let root = match args.get("file_path").and_then(Value::as_str) {
-                Some(fp) => workspace_root_for(Path::new(fp)),
-                None => ctx.cwd.clone(),
+            // 语言: 有 file_path 用它的扩展名定; 没有则默认 Rust (向后兼容)。
+            let (lang, root) = match args.get("file_path").and_then(Value::as_str) {
+                Some(fp) => {
+                    let p = Path::new(fp);
+                    match lang_for_path(p) {
+                        Some(l) => (l, workspace_root_for(p, &l)),
+                        None => return Ok(unsupported_ext(p)),
+                    }
+                }
+                None => (lang_for_extension("rs").unwrap(), ctx.cwd.clone()),
             };
-            let client = match ctx.lsp.client_for_root(&root).await {
+            let client = match ctx.lsp.client_for(&root, lang.server_cmd, lang.server_args).await {
                 Ok(c) => c,
-                Err(e) => return Ok(server_unavailable(&e.to_string())),
+                Err(e) => return Ok(server_unavailable(lang.server_cmd, &e.to_string())),
             };
             if !client.wait_until_ready(READY_TIMEOUT).await {
                 return Ok(not_ready(client.is_dead()));
@@ -100,23 +110,22 @@ impl Tool for LspTool {
             .ok_or_else(|| ToolError::InvalidArgs("file_path is required".into()))?;
         let path = PathBuf::from(file_path);
 
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            return Ok(ToolOutput::error(
-                "The Lsp tool currently supports only Rust (.rs) files (rust-analyzer).",
-            ));
-        }
+        let lang = match lang_for_path(&path) {
+            Some(l) => l,
+            None => return Ok(unsupported_ext(&path)),
+        };
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => return Ok(ToolOutput::error(format!("could not read {file_path}: {e}"))),
         };
         let uri = path_to_file_uri(&path);
-        let root = workspace_root_for(&path);
+        let root = workspace_root_for(&path, &lang);
 
-        let client = match ctx.lsp.client_for_root(&root).await {
+        let client = match ctx.lsp.client_for(&root, lang.server_cmd, lang.server_args).await {
             Ok(c) => c,
-            Err(e) => return Ok(server_unavailable(&e.to_string())),
+            Err(e) => return Ok(server_unavailable(lang.server_cmd, &e.to_string())),
         };
-        if let Err(e) = client.sync(&uri, "rust", &text).await {
+        if let Err(e) = client.sync(&uri, lang.language_id, &text).await {
             return Ok(ToolOutput::error(format!(
                 "failed to sync the document to the language server: {e}"
             )));
@@ -206,9 +215,18 @@ fn not_ready(is_dead: bool) -> ToolOutput {
     }
 }
 
-fn server_unavailable(detail: &str) -> ToolOutput {
+fn server_unavailable(server: &str, detail: &str) -> ToolOutput {
     ToolOutput::error(format!(
-        "could not start the language server ({detail}). Is rust-analyzer installed and on PATH?"
+        "could not start the language server '{server}' ({detail}). Is it installed and on PATH?"
+    ))
+}
+
+/// 没有为该扩展名配置语言服务器时的提示 (写给模型读)。
+fn unsupported_ext(path: &Path) -> ToolOutput {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    ToolOutput::error(format!(
+        "No language server is configured for '.{ext}' files. Supported: Rust (.rs), Go (.go), \
+         Python (.py/.pyi), TypeScript/JavaScript (.ts/.tsx/.js/.jsx), C/C++ (.c/.h/.cpp/.hpp/...)."
     ))
 }
 
@@ -225,28 +243,7 @@ fn position(args: &Value) -> Result<(u32, u32), String> {
     Ok((line.saturating_sub(1) as u32, ch.saturating_sub(1) as u32))
 }
 
-/// 找文件所属的 cargo 工程根 (向上找 Cargo.toml; 优先最外层 `[workspace]`), 而非进程 cwd (review #6)。
-fn workspace_root_for(file: &Path) -> PathBuf {
-    let mut nearest: Option<PathBuf> = None;
-    let mut outermost_ws: Option<PathBuf> = None;
-    for dir in file.ancestors().skip(1) {
-        let manifest = dir.join("Cargo.toml");
-        if manifest.is_file() {
-            if nearest.is_none() {
-                nearest = Some(dir.to_path_buf());
-            }
-            if std::fs::read_to_string(&manifest)
-                .map(|s| s.contains("[workspace]"))
-                .unwrap_or(false)
-            {
-                outermost_ws = Some(dir.to_path_buf()); // 继续往上, 最外层 workspace 胜出
-            }
-        }
-    }
-    outermost_ws
-        .or(nearest)
-        .unwrap_or_else(|| file.parent().map(Path::to_path_buf).unwrap_or_default())
-}
+// 工程根查找 (按语言标志文件) 已移到 `syncode_lsp::lang::workspace_root_for` (多语言, §5.3)。
 
 // ---- LSP JSON 结果 → 写给模型读的文本 ----
 

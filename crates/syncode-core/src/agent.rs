@@ -7,13 +7,16 @@
 //! 可选挂 [`SessionStore`] 做持久化 (D2/D4): 每条消息 append 落库, turn 起点打 checkpoint;
 //! `resume_session` 从库重建内存 Session。
 
+use crate::background::BackgroundRegistry;
 use crate::context::ContextManager;
 use crate::file_state::FileStateCache;
-use crate::permission::{ActionClass, AllowAll, Approver, Decision};
+use crate::fs_scope::SharedFsScope;
+use crate::permission::{AllowAll, Approver, Decision};
 use crate::registry::ToolRegistry;
 use crate::session::Session;
 use crate::state::SessionStore;
 use crate::tool::ToolCtx;
+use std::path::PathBuf;
 use std::sync::Arc;
 use syncode_lsp::LspManager;
 use syncode_llm::client::{DeepSeekClient, MODEL};
@@ -33,6 +36,13 @@ pub struct AgentLoop {
     files: Arc<FileStateCache>,
     /// 跨工具共享的 LSP 客户端管理器 (常驻语言服务器复用, §4/§6.2)。
     lsp: Arc<LspManager>,
+    /// 文件写收容守卫 (P1c)。无则不收容 (写类工具裸 std::fs)。
+    fs: SharedFsScope,
+    /// 共享后台任务注册表 (§5.5): 全 turn 复用, 后台任务跨 dispatch 可查/可杀。
+    background: Arc<BackgroundRegistry>,
+    /// 授权项目根 = 工具 cwd 的**单一真相** (review fix #14): 与 approver / fs-scope 同一值, 别每次
+    /// dispatch 重读 `std::env::current_dir()` (那会与两闸钉死的根漂移)。
+    cwd: PathBuf,
     /// 可选持久化 (D2/D4)。无则纯内存。
     store: Option<SessionStore>,
     session_id: String,
@@ -47,6 +57,9 @@ impl AgentLoop {
             approver: Arc::new(AllowAll),
             files: Arc::new(FileStateCache::new()),
             lsp: Arc::new(LspManager::new()),
+            fs: None,
+            background: Arc::new(BackgroundRegistry::new()),
+            cwd: std::env::current_dir().unwrap_or_default(),
             store: None,
             session_id: "default".to_string(),
         }
@@ -54,6 +67,18 @@ impl AgentLoop {
 
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = approver;
+        self
+    }
+
+    /// 挂上文件写收容守卫 (P1c): 写类工具落盘前校验路径在授权根内。
+    pub fn with_fs_scope(mut self, fs: SharedFsScope) -> Self {
+        self.fs = fs;
+        self
+    }
+
+    /// 钉死工具 cwd = 授权项目根 (应传与 approver / fs-scope 相同的 root, 单一真相, review fix #14)。
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = cwd.into();
         self
     }
 
@@ -190,27 +215,33 @@ impl AgentLoop {
                 return format!("<tool_use_error>invalid tool arguments JSON: {e}</tool_use_error>");
             }
         };
-        // 危险工具走审批 (§7)。当前粗粒度按 ArbitraryExec; 后续按工具语义细分 ActionClass。
+        // 危险动作走审批 (§7.5): 工具据 args **自分类** (Bash 按命令、Write/Edit 按目标路径),
+        // 审批器按可逆性 / 影响面判。`classify` 返回 `None` = 安全, 不过闸。
         // **穷举 match (无通配)**: Ask 在没有人类审批通道前 fail-closed —— 绝不静默放行
         // (否则接入真审批器时 Ask 会塌成 Allow, 任意命令无提示执行, 破坏放权底座)。
-        if tool.is_dangerous() {
-            match self.approver.decide(&ActionClass::ArbitraryExec) {
+        if let Some(req) = tool.classify(&args) {
+            match self.approver.decide(&req) {
                 Decision::Allow => {}
                 Decision::Deny => {
-                    return format!("<tool_use_error>permission denied for {name}</tool_use_error>");
+                    return format!(
+                        "<tool_use_error>permission denied: {name} ({:?}) is blocked by the approver policy</tool_use_error>",
+                        req.class
+                    );
                 }
                 Decision::Ask => {
+                    let what = req.target.as_deref().unwrap_or(name);
                     return format!(
-                        "<tool_use_error>{name} requires human approval, which is not wired up yet; refusing to execute</tool_use_error>"
+                        "<tool_use_error>{name} needs human approval for a {:?} action ({what}), but \
+                         interactive approval is not wired up yet, so it was refused. If this is safe and \
+                         intended, pre-authorize it in the approver policy (e.g. an allowed write root).</tool_use_error>",
+                        req.class
                     );
                 }
             }
         }
-        let ctx = ToolCtx::with_lsp(
-            self.files.clone(),
-            std::env::current_dir().unwrap_or_default(),
-            self.lsp.clone(),
-        );
+        let mut ctx = ToolCtx::with_lsp(self.files.clone(), self.cwd.clone(), self.lsp.clone());
+        ctx.fs = self.fs.clone();
+        ctx.background = self.background.clone();
         match tool.call(args, &ctx).await {
             Ok(out) if out.is_error => format!("<tool_use_error>{}</tool_use_error>", out.content),
             Ok(out) => out.content,
@@ -288,45 +319,95 @@ mod tests {
         assert_eq!(out, "echo: hi");
     }
 
-    struct DangerTool(Arc<std::sync::atomic::AtomicBool>);
+    /// 测试工具: 把自己分类成指定 [`ActionClass`], call 时翻 ran 标记 —— 验证审批闸是否真挡住执行。
+    struct ClassTool {
+        class: crate::permission::ActionClass,
+        target: Option<String>,
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
     #[async_trait]
-    impl Tool for DangerTool {
+    impl Tool for ClassTool {
         fn name(&self) -> &str {
             "danger"
         }
         fn description(&self) -> &str {
-            "a dangerous tool"
+            "a tool that classifies itself for the approver"
         }
-        fn is_dangerous(&self) -> bool {
-            true
+        fn classify(&self, _args: &Value) -> Option<crate::permission::ActionRequest> {
+            let mut req = crate::permission::ActionRequest::new(self.class.clone(), "danger");
+            req.target = self.target.clone();
+            Some(req)
         }
         fn parameters(&self) -> Value {
             json!({"type":"object","properties":{},"additionalProperties":false})
         }
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(ToolOutput::ok("ran"))
         }
     }
 
+    fn class_tool(
+        class: crate::permission::ActionClass,
+        target: Option<&str>,
+    ) -> (Arc<dyn Tool>, Arc<std::sync::atomic::AtomicBool>) {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tool = Arc::new(ClassTool { class, target: target.map(str::to_string), ran: ran.clone() });
+        (tool, ran)
+    }
+
     struct AskAll;
     impl crate::permission::Approver for AskAll {
-        fn decide(&self, _a: &crate::permission::ActionClass) -> crate::permission::Decision {
+        fn decide(&self, _req: &crate::permission::ActionRequest) -> crate::permission::Decision {
             crate::permission::Decision::Ask
         }
     }
 
     #[tokio::test]
     async fn ask_decision_fails_closed_and_does_not_execute() {
-        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let agent = AgentLoop::new(dummy_client(), registry_with(Arc::new(DangerTool(ran.clone()))))
-            .with_approver(Arc::new(AskAll));
+        let (tool, ran) = class_tool(crate::permission::ActionClass::ArbitraryExec, None);
+        let agent =
+            AgentLoop::new(dummy_client(), registry_with(tool)).with_approver(Arc::new(AskAll));
         let out = agent.dispatch_tool(&call("danger", "{}")).await;
-        assert!(out.contains("requires human approval"), "got: {out}");
+        assert!(out.contains("needs human approval"), "got: {out}");
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "dangerous tool must NOT execute on Ask"
         );
+    }
+
+    #[tokio::test]
+    async fn policy_allows_safe_class_and_runs() {
+        // Build (可逆/项目内) → PolicyApprover 放行 → 工具真执行。
+        let (tool, ran) = class_tool(crate::permission::ActionClass::Build, None);
+        let agent = AgentLoop::new(dummy_client(), registry_with(tool))
+            .with_approver(Arc::new(crate::permission::PolicyApprover::new("/proj")));
+        let out = agent.dispatch_tool(&call("danger", "{}")).await;
+        assert_eq!(out, "ran");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "safe class must execute");
+    }
+
+    #[tokio::test]
+    async fn policy_refuses_outward_class() {
+        // Network (外发) → PolicyApprover Ask → fail-closed 拒, 工具不执行。
+        let (tool, ran) = class_tool(crate::permission::ActionClass::Network, None);
+        let agent = AgentLoop::new(dummy_client(), registry_with(tool))
+            .with_approver(Arc::new(crate::permission::PolicyApprover::new("/proj")));
+        let out = agent.dispatch_tool(&call("danger", "{}")).await;
+        assert!(out.contains("needs human approval"), "got: {out}");
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst), "outward class must NOT execute");
+    }
+
+    #[tokio::test]
+    async fn policy_refuses_write_outside_root() {
+        // WriteFs 根外 → Ask → 拒。
+        let (tool, ran) =
+            class_tool(crate::permission::ActionClass::WriteFs, Some("/etc/cron.d/evil"));
+        let agent = AgentLoop::new(dummy_client(), registry_with(tool))
+            .with_approver(Arc::new(crate::permission::PolicyApprover::new("/proj")));
+        let out = agent.dispatch_tool(&call("danger", "{}")).await;
+        assert!(out.contains("needs human approval"), "got: {out}");
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

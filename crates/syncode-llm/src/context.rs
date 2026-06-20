@@ -143,6 +143,9 @@ pub struct TrimPolicy {
     pub stub_tool_results: bool,
     /// 存根标记文本。
     pub tool_result_marker: String,
+    /// 比整体存根更**软**的压缩: 非保留窗口的工具结果若超过此字符数, 截成 head+tail (保留首尾、删中段)。
+    /// `None` = 不截断。与 `stub_tool_results` 同开时 stub 优先 (更激进)。用 [`eval`](crate::eval) 量化对比。
+    pub max_tool_result_chars: Option<usize>,
 }
 
 impl Default for TrimPolicy {
@@ -152,6 +155,7 @@ impl Default for TrimPolicy {
             reclaim_inflight_cot: true,
             stub_tool_results: false,
             tool_result_marker: "[Old tool result content cleared]".to_string(),
+            max_tool_result_chars: None,
         }
     }
 }
@@ -191,20 +195,82 @@ impl TrimPolicy {
             }
         }
 
-        // 2) 工具结果存根: 超出保留窗口的工具轮所配对的 tool 结果 content 置存根 (保留配对结构)。
-        if self.stub_tool_results {
-            let kept_ids = kept_tool_call_ids(messages, &kept);
+        // 2) 工具结果压缩: 超出保留窗口的工具轮所配对的 tool 结果 (保留配对结构, 只改 content)。
+        //    stub_tool_results → 整体存根 (最激进); 否则 max_tool_result_chars → 软截断 head+tail。
+        //    **工具结果窗口与 CoT 窗口解耦** (review fix #13): 至少保最近 1 个工具轮的结果不动 —— 否则
+        //    keep_recent_cot_rounds=0 + stub/truncate 会把模型下一步必须用的最新结果也截掉。
+        if self.stub_tool_results || self.max_tool_result_chars.is_some() {
+            let result_keep_from = rounds.len().saturating_sub(self.keep_recent_cot_rounds.max(1));
+            let result_kept: HashSet<usize> = rounds[result_keep_from..].iter().copied().collect();
+            let kept_ids = kept_tool_call_ids(messages, &result_kept);
             for m in messages.iter_mut() {
-                if m.role == Role::Tool {
-                    if let Some(id) = m.tool_call_id.as_deref() {
-                        if !kept_ids.contains(id) {
-                            m.content = Some(self.tool_result_marker.clone());
+                if m.role != Role::Tool {
+                    continue;
+                }
+                let outside_window = m
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| !kept_ids.contains(id));
+                if !outside_window {
+                    continue;
+                }
+                if self.stub_tool_results {
+                    m.content = Some(self.tool_result_marker.clone());
+                } else if let Some(cap) = self.max_tool_result_chars {
+                    if let Some(c) = &m.content {
+                        if c.chars().count() > cap {
+                            m.content = Some(truncate_middle(c, cap));
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// 把 `s` 压到约 `cap` 个字符: 保留 head + tail, 中段换成省略标记 (char-boundary 安全)。
+/// 用于工具结果软压缩 —— 长结果的开头/结尾通常信息量最高, 中段可丢。
+pub fn truncate_middle(s: &str, cap: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= cap {
+        return s.to_string();
+    }
+    let marker = "\n…[middle truncated]…\n";
+    let marker_len = marker.chars().count();
+    // cap 太小, 放不下 head+marker+tail → 硬截前 cap 个字符 (否则截断后**反而变长**, review fix #20)。
+    if cap < marker_len + 2 {
+        return chars[..cap].iter().collect();
+    }
+    let keep = cap - marker_len;
+    let head = keep / 2;
+    let tail = keep - head;
+    let head_str: String = chars[..head].iter().collect();
+    let tail_str: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head_str}{marker}{tail_str}")
+}
+
+/// **token 估算** (§5.4 量化压缩的基础): 对一组 wire 消息估总 token 数。
+/// 启发式 = 每条消息的 content/reasoning/tool_call 文本字节数之和 /4 + 每条固定 framing 开销。
+/// 这是**相对**度量 (用于跨策略对比压缩率), 非精确 tokenizer —— 精确值由真 tokenizer 给, 但相对趋势一致。
+pub fn estimate_tokens(messages: &[Message]) -> usize {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+fn estimate_message_tokens(m: &Message) -> usize {
+    let mut bytes = 0usize;
+    if let Some(c) = &m.content {
+        bytes += c.len();
+    }
+    if let Some(r) = &m.reasoning_content {
+        bytes += r.len();
+    }
+    if let Some(tcs) = &m.tool_calls {
+        for tc in tcs {
+            bytes += tc.function.name.len() + tc.function.arguments.len() + 8;
+        }
+    }
+    // ~4 字节/token + 每条消息固定 framing 开销 (role 等)。
+    bytes / 4 + 4
 }
 
 #[cfg(test)]
@@ -372,5 +438,31 @@ mod tests {
         let out = normalize_for_api(&msgs);
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].content.as_deref(), Some("real answer"));
+    }
+
+    #[test]
+    fn tool_result_window_protects_last_round_even_with_cot_zero() {
+        // keep_recent_cot_rounds=0 + stub: 旧轮结果存根, 但最新轮结果必须原样 (review fix #13)。
+        let mut msgs = vec![
+            user("u1"),
+            asst_tool("c1", Some("r")),
+            tool_res("c1", "OLD RESULT"),
+            user("u2"),
+            asst_tool("c2", Some("r")),
+            tool_res("c2", "RECENT RESULT"),
+        ];
+        let policy =
+            TrimPolicy { keep_recent_cot_rounds: 0, stub_tool_results: true, ..Default::default() };
+        policy.apply(&mut msgs);
+        assert_eq!(msgs[2].content.as_deref(), Some("[Old tool result content cleared]"));
+        assert_eq!(msgs[5].content.as_deref(), Some("RECENT RESULT"), "latest result must survive");
+    }
+
+    #[test]
+    fn truncate_middle_small_cap_does_not_expand() {
+        // cap 太小放不下 marker → 硬截, 绝不让结果变长 (review fix #20)。
+        let s = "x".repeat(6);
+        let out = truncate_middle(&s, 5);
+        assert!(out.chars().count() <= 5, "got {} chars: {out}", out.chars().count());
     }
 }

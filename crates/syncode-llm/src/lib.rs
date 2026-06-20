@@ -14,6 +14,7 @@
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod eval;
 pub mod stream;
 pub mod wire;
 

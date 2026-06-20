@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use syncode_ast::{AstError, Engine};
 use syncode_core::file_state::FileState;
+use syncode_core::permission::{ActionClass, ActionRequest};
 use syncode_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
 pub struct AstEditTool;
@@ -17,8 +18,13 @@ impl Tool for AstEditTool {
         "AstEdit"
     }
 
-    fn is_dangerous(&self) -> bool {
-        true
+    /// 结构化改写 = `WriteFs`; 带目标路径供审批做根内 / 根外判定。
+    fn classify(&self, args: &Value) -> Option<ActionRequest> {
+        let mut req = ActionRequest::new(ActionClass::WriteFs, "AstEdit");
+        if let Some(p) = args.get("file_path").and_then(Value::as_str) {
+            req = req.with_target(p);
+        }
+        Some(req)
     }
 
     fn description(&self) -> &str {
@@ -63,6 +69,8 @@ impl Tool for AstEditTool {
             .ok_or_else(|| ToolError::InvalidArgs("rewrite is required".into()))?;
         let lang_arg = args.get("lang").and_then(Value::as_str);
         let path = PathBuf::from(file_path);
+        // 写收容 (P1c): 路径必须在授权写根内 (canonicalize 解析符号链接, 挡逃逸)。
+        ctx.ensure_writable(&path)?;
 
         let engine = match lang_arg {
             Some(name) => Engine::for_name(name)

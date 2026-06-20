@@ -7,6 +7,7 @@
 mod ast_edit;
 mod ast_grep;
 mod bash;
+mod bash_output;
 mod edit;
 mod fsutil;
 mod grep;
@@ -20,6 +21,7 @@ mod tests;
 pub use ast_edit::AstEditTool;
 pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
+pub use bash_output::BashOutputTool;
 pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use lsp::LspTool;
@@ -39,4 +41,5 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(AstEditTool));
     registry.register(Arc::new(LspTool));
     registry.register(Arc::new(BashTool));
+    registry.register(Arc::new(BashOutputTool));
 }

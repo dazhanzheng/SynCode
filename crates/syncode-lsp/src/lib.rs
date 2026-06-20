@@ -20,6 +20,8 @@
 //!   - path↔uri 走 `url` crate 标准编码, 两侧一致, 诊断键规范化 (review #7/#8/#37)。
 //!   - 每 client 自带文档版本 + 内容哈希: didChange 前**去重**, 内容没变不重发 (review #20)。
 
+pub mod lang;
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -182,7 +184,13 @@ pub struct LspClient {
 impl LspClient {
     /// 启动 `server` (如 `"rust-analyzer"`), 以 `root_uri` 为工程根做 initialize/initialized 握手。
     pub async fn spawn(server: &str, root_uri: &str) -> Result<Self, LspError> {
+        Self::spawn_cmd(server, &[], root_uri).await
+    }
+
+    /// 同 [`spawn`], 但可给服务器传命令行参数 (如 `pyright-langserver --stdio`、`typescript-language-server --stdio`)。
+    pub async fn spawn_cmd(server: &str, args: &[&str], root_uri: &str) -> Result<Self, LspError> {
         let mut child = Command::new(server)
+            .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -529,44 +537,50 @@ fn hash_str(s: &str) -> u64 {
 
 // ---- 跨工具复用的管理器 ----
 
-/// 跨工具调用复用的 LSP 客户端管理器: 按工程根**惰性启动并缓存**常驻 [`LspClient`] (v1 = rust-analyzer)。
+/// 跨工具调用复用的 LSP 客户端管理器: 按 `(工程根, 服务器)` **惰性启动并缓存**常驻 [`LspClient`]。
+/// 多语言: 同一仓库里 Rust / Go / TS 各自一个常驻 server, 按 key 区分 (§5.3)。
 /// 放进 `ToolCtx`, 与文件缓存一样跨工具调用共享 (持久活状态的前提)。
 pub struct LspManager {
-    server: String,
-    clients: tokio::sync::Mutex<HashMap<PathBuf, Arc<LspClient>>>,
+    /// key = (工程根, 服务器可执行名)。
+    clients: tokio::sync::Mutex<HashMap<(PathBuf, String), Arc<LspClient>>>,
 }
 
 impl LspManager {
     pub fn new() -> Self {
-        Self {
-            server: "rust-analyzer".to_string(),
-            clients: tokio::sync::Mutex::new(HashMap::new()),
-        }
+        Self { clients: tokio::sync::Mutex::new(HashMap::new()) }
     }
 
-    /// 取 (或惰性启动并缓存) 某工程根的客户端。缓存里若是**已死**的 client → 踢掉重启 (review #9)。
-    pub async fn client_for_root(&self, root: &Path) -> Result<Arc<LspClient>, LspError> {
+    /// 取 (或惰性启动并缓存) 某 `(工程根, 服务器)` 的客户端。缓存里若是**已死**的 → 踢掉重启 (review #9)。
+    pub async fn client_for(
+        &self,
+        root: &Path,
+        server: &str,
+        args: &[&str],
+    ) -> Result<Arc<LspClient>, LspError> {
+        let key = (root.to_path_buf(), server.to_string());
         let mut map = self.clients.lock().await;
-        if let Some(c) = map.get(root) {
+        if let Some(c) = map.get(&key) {
             if !c.is_dead() {
                 return Ok(c.clone());
             }
-            map.remove(root); // 死了的不复用
+            map.remove(&key); // 死了的不复用
         }
-        let client = Arc::new(LspClient::spawn(&self.server, &path_to_file_uri(root)).await?);
-        map.insert(root.to_path_buf(), client.clone());
+        let client = Arc::new(LspClient::spawn_cmd(server, args, &path_to_file_uri(root)).await?);
+        map.insert(key, client.clone());
         Ok(client)
     }
 
     /// 文件落盘改动后调用 (Edit/Write/AstEdit 写完): 对**已打开该文档**的常驻 client 重读磁盘并推
     /// didChange, 让索引与编辑保持同步 (跨文件正确性 + 暖索引)。未打开的文档不强开。无 client 则 no-op。
+    /// languageId 按文件扩展名定 (didChange 其实不依赖它, 但 sync 接口需要)。
     pub async fn notify_file_changed(&self, path: &Path) {
         let uri = path_to_file_uri(path);
+        let lang_id = lang::language_id_for_path(path);
         let clients = self.clients.lock().await;
-        for (root, client) in clients.iter() {
+        for ((root, _server), client) in clients.iter() {
             if path.starts_with(root) && !client.is_dead() && client.is_open(&uri) {
                 if let Ok(text) = std::fs::read_to_string(path) {
-                    let _ = client.sync(&uri, "rust", &text).await;
+                    let _ = client.sync(&uri, lang_id, &text).await;
                 }
                 return;
             }

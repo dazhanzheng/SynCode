@@ -1,6 +1,9 @@
 //! 文件工具集成测试: 验证 Read/Write/Edit/Grep 的契约 + 共享缓存联动 (必先读 / stale / 原子写)。
 
-use crate::{AstEditTool, AstGrepTool, BashTool, EditTool, GrepTool, LspTool, ReadTool, WriteTool};
+use crate::{
+    AstEditTool, AstGrepTool, BashOutputTool, BashTool, EditTool, GrepTool, LspTool, ReadTool,
+    WriteTool,
+};
 use serde_json::json;
 use std::sync::Arc;
 use syncode_core::tool::{Tool, ToolCtx};
@@ -8,6 +11,67 @@ use syncode_core::FileStateCache;
 
 fn ctx() -> ToolCtx {
     ToolCtx::new(Arc::new(FileStateCache::new()), std::env::current_dir().unwrap())
+}
+
+/// run_in_background (§5.5): Bash 后台跑 → 立刻拿 task id → BashOutput 轮询读到输出 + 退出状态。
+#[tokio::test]
+async fn bash_run_in_background_and_poll() {
+    let c = ctx(); // 同一个 ctx → 共享后台注册表
+    let started = BashTool
+        .call(json!({"command": "echo hello-bg", "run_in_background": true}), &c)
+        .await
+        .unwrap();
+    assert!(!started.is_error, "{}", started.content);
+    let id = started.content.split('`').nth(1).unwrap_or("").to_string();
+    assert!(id.starts_with("bash_"), "unexpected start message: {}", started.content);
+
+    let mut saw_output = false;
+    let mut saw_exit = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let out = BashOutputTool.call(json!({ "id": id }), &c).await.unwrap();
+        if out.content.contains("hello-bg") {
+            saw_output = true;
+        }
+        if out.content.contains("exited") {
+            saw_exit = true;
+            break;
+        }
+    }
+    assert!(saw_output, "should have captured background stdout");
+    assert!(saw_exit, "task should have reached exited state");
+
+    // 未知 id → 错误。
+    let bad = BashOutputTool.call(json!({"id": "bash_nope"}), &c).await.unwrap();
+    assert!(bad.is_error);
+}
+
+/// 逃逸测试 (P1c): 挂了写收容 (`FsScope`) 后, Write 到授权根**外**必须被构造级拒绝。
+#[tokio::test]
+async fn write_outside_fs_scope_is_refused() {
+    use syncode_core::FsScope;
+    let root = tempfile::tempdir().unwrap();
+    let mut c = ToolCtx::new(Arc::new(FileStateCache::new()), root.path().to_path_buf());
+    c.fs = Some(Arc::new(FsScope::new(root.path())));
+
+    // 根内写 → 放行 (新文件免读)。
+    let inside = root.path().join("ok.txt");
+    let out = WriteTool
+        .call(json!({"file_path": inside.to_str().unwrap(), "content": "hi"}), &c)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "in-root write should succeed: {}", out.content);
+    assert!(inside.exists());
+
+    // 根外 (且 temp 外) 写 → 被写收容拒 (temp 本身是写根, 故取 temp 父目录之外)。
+    if let Some(above_temp) = std::env::temp_dir().parent() {
+        let escaped = above_temp.join("syncode_escape_evil.txt");
+        let res = WriteTool
+            .call(json!({"file_path": escaped.to_str().unwrap(), "content": "pwned"}), &c)
+            .await;
+        assert!(res.is_err(), "out-of-root write must be refused");
+        assert!(!escaped.exists(), "the escaped file must NOT have been written");
+    }
 }
 
 #[tokio::test]
@@ -390,16 +454,21 @@ async fn bash_scrubs_parent_env_keeps_essentials() {
 }
 
 #[tokio::test]
-async fn lsp_rejects_non_rust_file() {
+async fn lsp_rejects_unsupported_extension() {
+    // 没有为 .zzz 配置语言服务器 → 明确提示 (确定性, 不依赖本机装没装某 server)。
     let dir = tempfile::tempdir().unwrap();
-    let f = dir.path().join("a.py");
-    std::fs::write(&f, "def x(): pass\n").unwrap();
+    let f = dir.path().join("a.zzz");
+    std::fs::write(&f, "whatever\n").unwrap();
     let ctx = ctx();
     let out = LspTool
         .call(json!({"operation": "documentSymbol", "file_path": f.to_str().unwrap()}), &ctx)
         .await
         .unwrap();
-    assert!(out.is_error && out.content.contains("only Rust"), "{}", out.content);
+    assert!(
+        out.is_error && out.content.contains("No language server is configured"),
+        "{}",
+        out.content
+    );
 }
 
 #[tokio::test]

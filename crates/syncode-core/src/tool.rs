@@ -2,10 +2,13 @@
 //!
 //! 核心理念: **error message 是写给模型读的** —— 措辞为引导模型下一步, 不是给人看。
 
+use crate::background::BackgroundRegistry;
 use crate::file_state::FileStateCache;
+use crate::fs_scope::SharedFsScope;
+use crate::permission::ActionRequest;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use syncode_llm::wire::{FunctionDef, ToolDef};
 use syncode_lsp::LspManager;
@@ -48,17 +51,32 @@ pub struct ToolCtx {
     pub cwd: PathBuf,
     /// 共享 LSP 客户端管理器: 跨工具调用复用常驻语言服务器 (§4 代码智能 / §6.2 机制③)。
     pub lsp: Arc<LspManager>,
+    /// 文件写收容守卫 (P1c)。`None` = 不收容 (测试 / standalone)。写类工具经 [`ensure_writable`](Self::ensure_writable) 过它。
+    pub fs: SharedFsScope,
+    /// 后台任务注册表 (§5.5): Bash 的 run_in_background 在此登记, `BashOutput` 据此查/杀。跨工具调用共享。
+    pub background: Arc<BackgroundRegistry>,
 }
 
 impl ToolCtx {
-    /// standalone / 测试用: 自带一个空的 LspManager。
+    /// standalone / 测试用: 自带一个空的 LspManager, 不挂写收容。
     pub fn new(files: Arc<FileStateCache>, cwd: PathBuf) -> Self {
         Self::with_lsp(files, cwd, Arc::new(LspManager::new()))
     }
 
     /// agent loop 用: 注入**共享**的 LspManager, 全 turn 复用同一组常驻服务器 (持久活状态)。
+    /// `fs` 默认 None、`background` 默认新建空的; agent loop 在 dispatch 里直接字段赋值换成**共享**实例
+    /// (`ctx.fs = ...; ctx.background = ...`), 故同一 AgentLoop 内跨 dispatch 一致。
     pub fn with_lsp(files: Arc<FileStateCache>, cwd: PathBuf, lsp: Arc<LspManager>) -> Self {
-        Self { files, cwd, lsp }
+        Self { files, cwd, lsp, fs: None, background: Arc::new(BackgroundRegistry::new()) }
+    }
+
+    /// 写类工具 (Write/Edit/AstEdit) 在落盘前调用: 挂了写收容则校验路径在授权根内, 否则放行。
+    /// 越界返回 model-readable 的 `Denied` 错误 (写给模型读, 利于自纠偏)。
+    pub fn ensure_writable(&self, path: &Path) -> Result<(), ToolError> {
+        if let Some(scope) = &self.fs {
+            scope.check_writable(path).map_err(|e| ToolError::Denied(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -74,9 +92,11 @@ pub trait Tool: Send + Sync {
     /// 参数 JSON Schema (§11)。建议满足 strict 三要素 (§11.4)。
     fn parameters(&self) -> Value;
 
-    /// 是否高风险 (改系统 / 跑模型给的命令 / 碰网络): 需子进程 + 沙箱 + 审批 (§5.2)。
-    fn is_dangerous(&self) -> bool {
-        false
+    /// 这次调用要执行的「语义动作」, 供审批 (§7.5)。返回 `None` = 安全、无需过闸 (读类工具默认如此)。
+    /// 危险工具据 `args` 把自己分类 (Bash 按命令、Write/Edit 按目标路径), 让审批按可逆性 / 影响面判,
+    /// 而不是「是不是命令」一刀切。分类是 UX/策略层, 真边界靠沙箱 (见 [`crate::permission`] 顶注)。
+    fn classify(&self, _args: &Value) -> Option<ActionRequest> {
+        None
     }
 
     /// 执行。`args` 是已从 `function.arguments` (JSON 字符串) 解析出的对象;

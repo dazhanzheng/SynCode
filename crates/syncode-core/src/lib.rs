@@ -11,8 +11,11 @@
 #![allow(dead_code, unused_variables)]
 
 pub mod agent;
+pub mod background;
 pub mod context;
 pub mod file_state;
+pub mod fs_scope;
+pub mod pathutil;
 pub mod permission;
 pub mod registry;
 pub mod session;
@@ -20,8 +23,10 @@ pub mod state;
 pub mod tool;
 
 pub use agent::AgentLoop;
+pub use background::{BackgroundRegistry, BackgroundTask, TaskState};
 pub use context::ContextManager;
 pub use file_state::{FileState, FileStateCache};
+pub use fs_scope::{FsScope, SharedFsScope};
 pub use registry::ToolRegistry;
 pub use session::Session;
 pub use tool::{Tool, ToolCtx, ToolError, ToolOutput};

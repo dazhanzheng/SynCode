@@ -1,7 +1,8 @@
 //! SynCode CLI — headless 装配入口 + 一个真实的 agentic 任务演示 (写代码 → 编译运行 → 自验)。
 
 use std::sync::Arc;
-use syncode_core::{AgentLoop, Session, ToolRegistry};
+use syncode_core::permission::PolicyApprover;
+use syncode_core::{AgentLoop, FsScope, Session, ToolRegistry};
 use syncode_llm::wire::Role;
 use syncode_llm::{DeepSeekClient, DeepSeekConfig};
 use syncode_tools::register_builtins;
@@ -31,7 +32,15 @@ async fn main() {
     register_builtins(&mut registry);
     println!("tools: {:?}", registry.names());
 
-    let mut agent = AgentLoop::new(Arc::new(client), registry);
+    // 真审批器 (策略档, autonomy-first): 项目根 + 临时目录内可逆操作放行, 外发/不可逆才 Ask
+    // (当前无交互通道 → Ask = fail-closed 拒)。替掉默认的 AllowAll —— Bash 不再裸奔 (§7.5 / 路线图 P0a)。
+    // 写收容守卫 (P1c): 文件写类工具构造级逃不出授权根 (项目根 + temp), 解析符号链接挡逃逸。
+    // 单一真相: approver / fs-scope / 工具 cwd 全用同一个 project_root (review fix #14)。
+    let project_root = std::env::current_dir().unwrap_or_default();
+    let mut agent = AgentLoop::new(Arc::new(client), registry)
+        .with_approver(Arc::new(PolicyApprover::new(&project_root)))
+        .with_fs_scope(Some(Arc::new(FsScope::new(&project_root))))
+        .with_cwd(&project_root);
     let mut session = Session::with_system(
         "You are SynCode, a coding agent with file tools and a Bash tool. Use absolute paths. \
          Verify your work by actually running it. Be concise.",

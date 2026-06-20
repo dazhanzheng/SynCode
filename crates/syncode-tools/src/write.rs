@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use syncode_core::file_state::FileState;
+use syncode_core::permission::{ActionClass, ActionRequest};
 use syncode_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
 pub struct WriteTool;
@@ -27,8 +28,13 @@ impl Tool for WriteTool {
          - file_path must be an absolute path."
     }
 
-    fn is_dangerous(&self) -> bool {
-        true // 写文件: 改系统状态
+    /// 写文件 = `WriteFs`; 带绝对目标路径供审批做根内 / 根外判定 (根内放行, 根外 Ask)。
+    fn classify(&self, args: &Value) -> Option<ActionRequest> {
+        let mut req = ActionRequest::new(ActionClass::WriteFs, "Write");
+        if let Some(p) = args.get("file_path").and_then(Value::as_str) {
+            req = req.with_target(p);
+        }
+        Some(req)
     }
 
     fn parameters(&self) -> Value {
@@ -53,6 +59,8 @@ impl Tool for WriteTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("content is required".into()))?;
         let path = PathBuf::from(file_path);
+        // 写收容 (P1c): 路径必须在授权写根内 (canonicalize 解析符号链接, 挡逃逸)。
+        ctx.ensure_writable(&path)?;
         let exists = path.exists();
 
         // 已存在文件: 必先读 + stale 检测 (新文件跳过)。

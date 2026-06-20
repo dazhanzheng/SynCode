@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use syncode_ast::Engine;
 use syncode_core::file_state::FileState;
+use syncode_core::permission::{ActionClass, ActionRequest};
 use syncode_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
 pub struct EditTool;
@@ -31,8 +32,13 @@ impl Tool for EditTool {
          - For a change defined by code structure rather than exact text, use AstEdit instead."
     }
 
-    fn is_dangerous(&self) -> bool {
-        true
+    /// 改文件 = `WriteFs`; 带目标路径供审批做根内 / 根外判定。
+    fn classify(&self, args: &Value) -> Option<ActionRequest> {
+        let mut req = ActionRequest::new(ActionClass::WriteFs, "Edit");
+        if let Some(p) = args.get("file_path").and_then(Value::as_str) {
+            req = req.with_target(p);
+        }
+        Some(req)
     }
 
     fn parameters(&self) -> Value {
@@ -64,6 +70,8 @@ impl Tool for EditTool {
             .ok_or_else(|| ToolError::InvalidArgs("new_string is required".into()))?;
         let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
         let path = PathBuf::from(file_path);
+        // 写收容 (P1c): 路径必须在授权写根内 (canonicalize 解析符号链接, 挡逃逸)。
+        ctx.ensure_writable(&path)?;
 
         if old_string == new_string {
             return Ok(ToolOutput::error(

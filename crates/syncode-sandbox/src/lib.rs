@@ -151,6 +151,31 @@ mod unix_backend {
     }
 }
 
+/// **Unix 资源硬限**: 在子进程 (post-fork, pre-exec) 里施加 `setrlimit` —— 给 [`std::os::unix::process::CommandExt::pre_exec`]
+/// 的闭包调用。`setrlimit` 是 async-signal-safe, 故可在 pre_exec 钩子里安全调用。
+///
+/// 当前只设 `RLIMIT_AS` (虚拟地址空间上限, 约束「单进程内存吃爆」), 仅在 `max_memory_bytes = Some` 时生效。
+/// **进程数上限**故意不走 `RLIMIT_NPROC` —— 它是**按真实 uid** 全局计数的, 设低会误伤用户自己其它进程的
+/// fork, 危险; per-job 的进程数硬限需 cgroups v2 (路线图 P2, 待 Linux 真机)。Windows 侧用 Job Object 的
+/// `ActiveProcessLimit` (见 [`windows_backend`])。
+///
+/// ⚠️ 仅 cross-target 编译验证, 运行时待真 Linux/macOS 验。
+#[cfg(unix)]
+pub fn apply_rlimits(max_memory_bytes: Option<u64>) -> std::io::Result<()> {
+    if let Some(bytes) = max_memory_bytes {
+        let lim = libc::rlimit {
+            rlim_cur: bytes as libc::rlim_t,
+            rlim_max: bytes as libc::rlim_t,
+        };
+        // SAFETY: setrlimit 是 async-signal-safe; 在 pre_exec (单线程子进程) 中调用安全。
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &lim) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub mod windows_backend {
     //! Job Object 真实实现 (windows-sys FFI, §4/§7)。
