@@ -13,6 +13,52 @@ fn ctx() -> ToolCtx {
     ToolCtx::new(Arc::new(FileStateCache::new()), std::env::current_dir().unwrap())
 }
 
+/// make_diff 产标准 unified diff: 有 `@@` hunk 头、改动行带 +/- 前缀; 无变化 → None。
+/// 这是 UI diff 视图逐行着色所依赖的契约。
+#[test]
+fn make_diff_produces_unified_hunks() {
+    use crate::fsutil::make_diff;
+    assert!(make_diff("f.rs", "same\n", "same\n").is_none(), "no change → None");
+    let d = make_diff("f.rs", "let a = 1;\nkeep\n", "let a = 2;\nkeep\n").expect("changed → Some");
+    assert_eq!(d.path, "f.rs");
+    assert!(d.unified.contains("@@"), "has a hunk header: {}", d.unified);
+    assert!(
+        d.unified.lines().any(|l| l.starts_with('-') && l.contains("= 1")),
+        "removed old line present: {}",
+        d.unified
+    );
+    assert!(
+        d.unified.lines().any(|l| l.starts_with('+') && l.contains("= 2")),
+        "added new line present: {}",
+        d.unified
+    );
+}
+
+/// Edit 工具产出携带 unified diff (供 UI diff 视图), 且不污染回给模型的 content。
+#[tokio::test]
+async fn edit_attaches_unified_diff() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "let a = 1;\n").unwrap();
+    let c = ctx();
+    // 必先 Read (建立缓存)。
+    ReadTool.call(json!({ "file_path": path.to_str().unwrap() }), &c).await.unwrap();
+    let out = EditTool
+        .call(
+            json!({"file_path": path.to_str().unwrap(), "old_string": "let a = 1;", "new_string": "let a = 2;"}),
+            &c,
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let d = out.diff.expect("Edit should attach a diff");
+    assert!(d.unified.contains("-let a = 1;"), "diff shows removal: {}", d.unified);
+    assert!(d.unified.contains("+let a = 2;"), "diff shows addition: {}", d.unified);
+    // content (给模型) 不含 diff。
+    assert!(!out.content.contains("@@"), "model-facing content must not carry the diff");
+}
+
 /// run_in_background (§5.5): Bash 后台跑 → 立刻拿 task id → BashOutput 轮询读到输出 + 退出状态。
 #[tokio::test]
 async fn bash_run_in_background_and_poll() {

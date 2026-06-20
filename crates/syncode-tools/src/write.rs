@@ -70,10 +70,17 @@ impl Tool for WriteTool {
             }
         }
 
+        // 旧内容 (供 diff): 已存在文件读现盘 LF 文本; 新文件为空。
+        let old = if exists {
+            fsutil::read_text_lf(&path).map(|(c, _)| c).unwrap_or_default()
+        } else {
+            String::new()
+        };
         let normalized = content.replace("\r\n", "\n"); // Write 全量替换, 输出统一 LF。
         fsutil::write_atomic(&path, &normalized)
             .map_err(|e| ToolError::Exec(format!("write failed for {file_path}: {e}")))?;
 
+        let diff = fsutil::make_diff(file_path, &old, &normalized);
         // 回写缓存 (offset/limit=None: 防下次写被自己误判 stale)。
         let mtime = fsutil::mtime_ms(&path).unwrap_or(0);
         ctx.files.set(
@@ -94,6 +101,10 @@ impl Tool for WriteTool {
         } else {
             format!("File created successfully at: {file_path}")
         };
-        Ok(ToolOutput::ok(msg))
+        let mut out = ToolOutput::ok(msg);
+        if let Some(d) = diff {
+            out = out.with_diff(d);
+        }
+        Ok(out)
     }
 }

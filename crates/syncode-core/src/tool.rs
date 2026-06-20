@@ -25,20 +25,36 @@ pub enum ToolError {
     Denied(String),
 }
 
+/// 一次文件改动的 unified diff (编辑类工具产出, 供 UI 渲染 diff 视图)。**不进**回给模型的 content。
+#[derive(Debug, Clone)]
+pub struct FileDiff {
+    /// 改动的文件路径 (展示用)。
+    pub path: String,
+    /// unified diff 文本 (`@@` hunk 头 + `+`/`-`/` ` 前缀行)。
+    pub unified: String,
+}
+
 /// 工具一次调用的产出。`content` 是回给模型的字符串 (§11.1)。
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
     /// 是否为错误结果 (回给模型时可据此标注)。
     pub is_error: bool,
+    /// 可选: 本次文件改动的 unified diff (编辑类工具产出)。仅供 UI 渲染, **不回给模型**。
+    pub diff: Option<FileDiff>,
 }
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self { content: content.into(), is_error: false, diff: None }
     }
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self { content: content.into(), is_error: true, diff: None }
+    }
+    /// 附带本次改动的 unified diff (供 UI; 不影响给模型的 content)。
+    pub fn with_diff(mut self, diff: FileDiff) -> Self {
+        self.diff = Some(diff);
+        self
     }
 }
 

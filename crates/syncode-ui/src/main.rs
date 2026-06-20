@@ -52,6 +52,8 @@ enum Line {
     Tool { name: String, args: String, result: Option<String>, ok: bool, expanded: bool },
     /// 本轮推理 (CoT) 全文, 可折叠: 折叠显示摘要, 展开显示完整链。
     Reasoning { text: String, expanded: bool },
+    /// 一次文件改动的 unified diff (可折叠, 默认展开): 按 +/-/@ 前缀逐行着色。
+    Diff { path: String, text: String, expanded: bool },
     Status(String),
 }
 
@@ -139,6 +141,10 @@ impl AgentApp {
             AgentEvent::Reasoning { text } => {
                 self.lines.push(Line::Reasoning { text, expanded: false })
             }
+            AgentEvent::FileChanged { path, diff } => {
+                // diff 是本功能的主角, 默认展开。
+                self.lines.push(Line::Diff { path, text: diff, expanded: true })
+            }
             AgentEvent::ToolStarted { name, args } => {
                 self.lines.push(Line::Tool { name, args, result: None, ok: true, expanded: false })
             }
@@ -201,6 +207,8 @@ impl AgentApp {
             ),
             // Reasoning 实际走 render_reasoning (可折叠); 此分支仅为 match 完备的兜底。
             Line::Reasoning { text, .. } => ("think", truncate(text, 120), theme.muted_foreground),
+            // Diff 实际走 render_diff; 此分支仅为 match 完备的兜底。
+            Line::Diff { path, .. } => ("diff", path.clone(), theme.muted_foreground),
             Line::Status(t) => ("·", t.clone(), theme.muted_foreground),
         };
         h_flex()
@@ -319,6 +327,77 @@ impl AgentApp {
         }
         col
     }
+
+    /// 可折叠 diff 视图: header (▸/▾ diff + path + (+adds -dels)); 展开时按 unified diff 前缀逐行着色
+    /// (绿=增 / 红=删 / 蓝=hunk头 / 暗=上下文), 等宽字体。语法 token 级高亮见路线图 §2.5 后续项。
+    fn render_diff(
+        &self,
+        i: usize,
+        path: &str,
+        text: &str,
+        expanded: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let glyph = if expanded { "▾" } else { "▸" };
+        let adds = text.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+        let dels = text.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+
+        let header = h_flex()
+            .id(("diff", i))
+            .gap_2()
+            .items_start()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _ev, _window, cx| {
+                if let Some(Line::Diff { expanded, .. }) = this.lines.get_mut(i) {
+                    *expanded = !*expanded;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .w(px(64.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("{glyph} diff")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(format!("{path}  +{adds} -{dels}")),
+            );
+
+        let mut col = v_flex().gap_1().child(header);
+        if expanded {
+            let rows: Vec<AnyElement> = text
+                .lines()
+                .map(|l| {
+                    let color: Hsla = if l.starts_with("+++") || l.starts_with("---") {
+                        theme.muted_foreground
+                    } else if l.starts_with('@') {
+                        rgb(0x58a6ff).into() // hunk 头
+                    } else if l.starts_with('+') {
+                        rgb(0x3fb950).into() // 增
+                    } else if l.starts_with('-') {
+                        rgb(0xf85149).into() // 删
+                    } else {
+                        theme.muted_foreground // 上下文
+                    };
+                    div().text_xs().text_color(color).child(l.to_string()).into_any_element()
+                })
+                .collect();
+            col = col.child(
+                v_flex()
+                    .pl(px(72.))
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .children(rows),
+            );
+        }
+        col
+    }
 }
 
 impl Render for AgentApp {
@@ -336,6 +415,9 @@ impl Render for AgentApp {
                     .into_any_element(),
                 Line::Reasoning { text, expanded } => {
                     self.render_reasoning(i, text, *expanded, cx).into_any_element()
+                }
+                Line::Diff { path, text, expanded } => {
+                    self.render_diff(i, path, text, *expanded, cx).into_any_element()
                 }
                 other => self.render_line(other, cx).into_any_element(),
             })

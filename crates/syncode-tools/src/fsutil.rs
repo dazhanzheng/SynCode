@@ -5,6 +5,23 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 use syncode_core::file_state::FileStateCache;
+use syncode_core::tool::FileDiff;
+
+/// 算一次改动的 unified diff (供 UI diff 视图)。`old`/`new` 应是 LF 归一文本。无变化 → `None`。
+/// context_radius=3 (标准 unified 上下文行数)。新文件传 `old = ""`。
+pub fn make_diff(path: &str, old: &str, new: &str) -> Option<FileDiff> {
+    if old == new {
+        return None;
+    }
+    let unified = similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .to_string();
+    if unified.trim().is_empty() {
+        return None;
+    }
+    Some(FileDiff { path: path.to_string(), unified })
+}
 
 /// 「必先读」+ stale 检测 (Write/Edit 对**已存在文件**用)。返回 `Some(写给模型读的错误串)` 表示拒绝,
 /// `None` 表示放行。逐字文案照搬 CC (§10, 写给模型自纠)。

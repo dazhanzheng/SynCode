@@ -40,6 +40,8 @@ pub enum AgentEvent {
     ToolStarted { name: String, args: String },
     /// 工具返回 (完整结果文本; UI 自行决定折叠/截断展示)。
     ToolFinished { name: String, result: String, is_error: bool },
+    /// 编辑类工具改了文件: 携带 unified diff (供 UI 渲染 diff 视图)。
+    FileChanged { path: String, diff: String },
     /// turn 正常结束。
     TurnDone,
 }
@@ -339,7 +341,16 @@ impl AgentLoop {
         ctx.background = self.background.clone();
         match tool.call(args, &ctx).await {
             Ok(out) if out.is_error => format!("<tool_use_error>{}</tool_use_error>", out.content),
-            Ok(out) => out.content,
+            Ok(out) => {
+                // 编辑类工具带了 diff → 发 FileChanged 事件 (供 UI diff 视图)。diff 不进给模型的 content。
+                if let Some(d) = &out.diff {
+                    self.emit(AgentEvent::FileChanged {
+                        path: d.path.clone(),
+                        diff: d.unified.clone(),
+                    });
+                }
+                out.content
+            }
             Err(e) => format!("<tool_use_error>{e}</tool_use_error>"),
         }
     }

@@ -128,6 +128,7 @@ impl Tool for AstEditTool {
         fsutil::write_atomic(&path, &to_write)
             .map_err(|e| ToolError::Exec(format!("write failed for {file_path}: {e}")))?;
 
+        let diff = fsutil::make_diff(file_path, &current, &updated);
         let mtime = fsutil::mtime_ms(&path).unwrap_or(0);
         ctx.files.set(
             &path,
@@ -142,9 +143,14 @@ impl Tool for AstEditTool {
         // 落盘改动主动推给 LSP (若该文件已在某常驻服务器里打开)。
         ctx.lsp.notify_file_changed(&path).await;
 
-        Ok(ToolOutput::ok(format!(
+        let msg = format!(
             "The file {file_path} has been updated with {n} structural replacement{} (syntax verified).",
             if n == 1 { "" } else { "s" }
-        )))
+        );
+        let mut out = ToolOutput::ok(msg);
+        if let Some(d) = diff {
+            out = out.with_diff(d);
+        }
+        Ok(out)
     }
 }

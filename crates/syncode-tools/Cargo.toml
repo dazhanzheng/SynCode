@@ -16,6 +16,8 @@ syncode-sandbox = { workspace = true }
 tempfile = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }
+# 编辑类工具 (Edit/Write/AstEdit) 产 unified diff 供 UI diff 视图。
+similar = "2"
 # Lsp 工具用 tokio::time (诊断推送等待); 异步本身经 async-trait。
 tokio = { workspace = true }
 

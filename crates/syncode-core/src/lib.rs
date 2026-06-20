@@ -29,7 +29,7 @@ pub use file_state::{FileState, FileStateCache};
 pub use fs_scope::{FsScope, SharedFsScope};
 pub use registry::ToolRegistry;
 pub use session::Session;
-pub use tool::{Tool, ToolCtx, ToolError, ToolOutput};
+pub use tool::{FileDiff, Tool, ToolCtx, ToolError, ToolOutput};
 
 /// 重导出 wire crate, 便于下游构造消息/工具定义。
 pub use syncode_llm;

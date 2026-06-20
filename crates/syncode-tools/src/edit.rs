@@ -127,6 +127,8 @@ impl Tool for EditTool {
             }
         }
 
+        // diff (供 UI diff 视图) 必须在 updated 被移动进缓存前算。
+        let diff = fsutil::make_diff(file_path, &current, &updated);
         ctx.files.set(
             &path,
             FileState {
@@ -139,6 +141,10 @@ impl Tool for EditTool {
         );
         // 落盘改动主动推给 LSP (若该文件已在某常驻服务器里打开), 保持索引与编辑同步。
         ctx.lsp.notify_file_changed(&path).await;
-        Ok(ToolOutput::ok(msg))
+        let mut out = ToolOutput::ok(msg);
+        if let Some(d) = diff {
+            out = out.with_diff(d);
+        }
+        Ok(out)
     }
 }
