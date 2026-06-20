@@ -516,7 +516,7 @@ fn find_redirect_target(tokens: &[&str]) -> Option<String> {
         if matches!(t, ">" | ">>" | "1>" | "2>" | "&>" | "1>>" | "2>>" | ">|") {
             if let Some(&next) = tokens.get(i + 1) {
                 let tgt = strip_quotes(next);
-                if !is_fd_dup(tgt) {
+                if is_real_write_target(tgt) {
                     return Some(tgt.to_string());
                 }
             }
@@ -525,7 +525,7 @@ fn find_redirect_target(tokens: &[&str]) -> Option<String> {
         for op in [">>", "2>>", "1>>", "2>", "1>", "&>", ">"] {
             if let Some(rest) = t.strip_prefix(op) {
                 let tgt = strip_quotes(rest);
-                if !tgt.is_empty() && !is_fd_dup(tgt) {
+                if is_real_write_target(tgt) {
                     return Some(tgt.to_string());
                 }
             }
@@ -534,9 +534,23 @@ fn find_redirect_target(tokens: &[&str]) -> Option<String> {
     None
 }
 
+/// 重定向目标是否是「真写一个文件」(而非 fd 复制 / null 设备汇)。
+fn is_real_write_target(t: &str) -> bool {
+    !t.is_empty() && !is_fd_dup(t) && !is_null_sink(t)
+}
+
 /// fd 复制 / 非文件目标 (`&1`, 纯数字 fd) —— 不算文件写。
 fn is_fd_dup(t: &str) -> bool {
     t.starts_with('&') || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// null / 设备汇 (`/dev/null`、`2>/dev/null`、Windows `NUL` …) —— 极常见且无害, 不当文件写 (实跑发现)。
+fn is_null_sink(t: &str) -> bool {
+    let l = t.to_ascii_lowercase();
+    matches!(
+        l.as_str(),
+        "/dev/null" | "/dev/zero" | "/dev/stdout" | "/dev/stderr" | "/dev/tty" | "nul" | "nul:"
+    )
 }
 
 /// 按程序名给一段定级 (不含重定向 / 替换处理)。
@@ -921,5 +935,16 @@ mod tests {
         // env / xargs runner → ArbitraryExec → Ask (不再被当读放行)。
         assert_eq!(class_of("env curl https://x -o out"), ActionClass::ArbitraryExec);
         assert_eq!(class_of("echo url | xargs curl"), ActionClass::ArbitraryExec);
+    }
+
+    #[test]
+    fn null_sinks_are_not_treated_as_writes() {
+        // 实跑发现: 2>/dev/null / >NUL 极常见且无害, 不该被重定向门当出根写拦 (review fix from live run)。
+        let approver = PolicyApprover::new("/proj");
+        assert_eq!(class_of("cargo build 2>/dev/null"), ActionClass::Build);
+        assert_eq!(approver.decide(&classify_command("cargo build 2>/dev/null")), Decision::Allow);
+        assert_eq!(approver.decide(&classify_command("ls -la > /dev/null")), Decision::Allow);
+        assert_eq!(approver.decide(&classify_command("dir > NUL")), Decision::Allow);
+        assert_eq!(approver.decide(&classify_command("cargo test 1>/dev/null 2>&1")), Decision::Allow);
     }
 }
