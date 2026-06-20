@@ -194,28 +194,88 @@ impl AgentApp {
         cx.notify();
     }
 
-    fn render_line(&self, line: &Line, cx: &Context<Self>) -> impl IntoElement {
+    /// 普通消息行 (User / Assistant / Status): 角色 tag 在上、正文在下; User 套淡色卡片。
+    /// Tool/Reasoning/Diff 有各自的可折叠渲染, 这里的分支仅作 `match` 兜底。
+    fn render_line(&self, line: &Line, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (label, body, color) = match line {
-            Line::User(t) => ("you", t.clone(), theme.primary),
-            Line::Assistant(t) => ("syncode", t.clone(), theme.foreground),
-            // Tool 实际走 render_tool (可折叠); 此分支仅为 match 完备的兜底, 不会被渲染调用命中。
-            Line::Tool { name, ok, result, .. } => (
-                if *ok { "tool" } else { "tool!" },
-                format!("{name}  {}", result.as_deref().unwrap_or("…")),
-                if *ok { theme.muted_foreground } else { theme.danger },
+        let assistant_tag: Hsla = rgb(0x4ec9b0).into(); // teal
+        match line {
+            Line::User(t) => self.msg_block("YOU", theme.primary, t, true, cx),
+            Line::Assistant(t) => self.msg_block("SYNCODE", assistant_tag, t, false, cx),
+            // 状态行: 居中、暗、小 —— 当分隔提示用。
+            Line::Status(t) => h_flex()
+                .w_full()
+                .justify_center()
+                .py_1()
+                .child(div().text_xs().text_color(theme.muted_foreground).child(t.clone()))
+                .into_any_element(),
+            Line::Tool { name, ok, result, .. } => self.msg_block(
+                if *ok { "TOOL" } else { "TOOL!" },
+                theme.muted_foreground,
+                &format!("{name}  {}", result.as_deref().unwrap_or("…")),
+                false,
+                cx,
             ),
-            // Reasoning 实际走 render_reasoning (可折叠); 此分支仅为 match 完备的兜底。
-            Line::Reasoning { text, .. } => ("think", truncate(text, 120), theme.muted_foreground),
-            // Diff 实际走 render_diff; 此分支仅为 match 完备的兜底。
-            Line::Diff { path, .. } => ("diff", path.clone(), theme.muted_foreground),
-            Line::Status(t) => ("·", t.clone(), theme.muted_foreground),
-        };
+            Line::Reasoning { text, .. } => {
+                self.msg_block("THINK", theme.muted_foreground, &truncate(text, 120), false, cx)
+            }
+            Line::Diff { path, .. } => {
+                self.msg_block("DIFF", theme.muted_foreground, path, false, cx)
+            }
+        }
+    }
+
+    /// 一个消息块: 顶部小号角色 tag + 下方正文。`carded` 时套淡色圆角卡片 (给 User 用, 视觉锚点)。
+    fn msg_block(
+        &self,
+        tag: &str,
+        tag_color: Hsla,
+        body: &str,
+        carded: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let mut block = v_flex()
+            .gap_1()
+            .child(div().text_xs().font_bold().text_color(tag_color).child(tag.to_string()))
+            .child(div().text_sm().text_color(theme.foreground).child(body.to_string()));
+        if carded {
+            block = block
+                .p_3()
+                .rounded(px(10.))
+                .bg(rgba(0x6675ff14))
+                .border_1()
+                .border_color(rgba(0x6675ff2b));
+        }
+        block.into_any_element()
+    }
+
+    /// 可折叠区块共用的 header: 可点击 (chevron + 角色 tag + 摘要), 圆角内边距, 翻转 `expanded`。
+    fn collapsible_header(
+        &self,
+        id: impl Into<ElementId>,
+        expanded: bool,
+        tag: &str,
+        tag_color: Hsla,
+        summary: String,
+        summary_color: Hsla,
+        cx: &Context<Self>,
+        toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let glyph = if expanded { "▾" } else { "▸" };
         h_flex()
+            .id(id)
             .gap_2()
-            .items_start()
-            .child(div().w(px(64.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(label))
-            .child(div().flex_1().text_sm().text_color(color).child(body))
+            .items_center()
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _ev, _window, cx| toggle(this, cx)))
+            .child(div().w(px(12.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(glyph))
+            .child(div().flex_shrink_0().text_xs().font_bold().text_color(tag_color).child(tag.to_string()))
+            .child(div().flex_1().text_sm().text_color(summary_color).child(summary))
     }
 
     /// 可折叠工具行: 可点击 header (▸/▾ + name + 结果摘要); 展开时在下方显示完整 args + result。
@@ -231,53 +291,44 @@ impl AgentApp {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let color = if ok { theme.muted_foreground } else { theme.danger };
-        let glyph = if expanded { "▾" } else { "▸" };
-        let label = if ok { "tool" } else { "tool!" };
+        let tag_color: Hsla = if ok { rgb(0x4ec9b0).into() } else { theme.danger };
+        let label = if ok { "TOOL" } else { "TOOL!" };
         let summary = match result {
             Some(r) => truncate(r, 120),
             None => "running…".to_string(),
         };
 
-        let header = h_flex()
-            .id(("tool", i))
-            .gap_2()
-            .items_start()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _ev, _window, cx| {
+        let header = self.collapsible_header(
+            ("tool", i),
+            expanded,
+            label,
+            tag_color,
+            format!("{name}  {summary}"),
+            theme.muted_foreground,
+            cx,
+            move |this, cx| {
                 if let Some(Line::Tool { expanded, .. }) = this.lines.get_mut(i) {
                     *expanded = !*expanded;
                     cx.notify();
                 }
-            }))
-            .child(
-                div()
-                    .w(px(64.))
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{glyph} {label}")),
-            )
-            .child(div().flex_1().text_sm().text_color(color).child(format!("{name}  {summary}")));
+            },
+        );
 
         let mut col = v_flex().gap_1().child(header);
         if expanded {
-            col = col.child(
-                div()
-                    .pl(px(72.))
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("args: {args}")),
-            );
+            let mut card = v_flex()
+                .ml(px(20.))
+                .gap_2()
+                .p_3()
+                .rounded(px(8.))
+                .bg(rgba(0x8a8a8a14))
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_xs()
+                .child(div().text_color(theme.muted_foreground).child(format!("args  {args}")));
             if let Some(r) = result {
-                col = col.child(
-                    div()
-                        .pl(px(72.))
-                        .text_xs()
-                        .text_color(theme.foreground)
-                        .child(format!("result:\n{r}")),
-                );
+                card = card.child(div().text_color(theme.foreground).child(r.to_string()));
             }
+            col = col.child(card);
         }
         col
     }
@@ -291,35 +342,32 @@ impl AgentApp {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let glyph = if expanded { "▾" } else { "▸" };
         let summary = truncate(text, 120);
 
-        let header = h_flex()
-            .id(("reasoning", i))
-            .gap_2()
-            .items_start()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _ev, _window, cx| {
+        let header = self.collapsible_header(
+            ("reasoning", i),
+            expanded,
+            "THINK",
+            theme.muted_foreground,
+            summary,
+            theme.muted_foreground,
+            cx,
+            move |this, cx| {
                 if let Some(Line::Reasoning { expanded, .. }) = this.lines.get_mut(i) {
                     *expanded = !*expanded;
                     cx.notify();
                 }
-            }))
-            .child(
-                div()
-                    .w(px(64.))
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{glyph} think")),
-            )
-            .child(div().flex_1().text_sm().text_color(theme.muted_foreground).child(summary));
+            },
+        );
 
         let mut col = v_flex().gap_1().child(header);
         if expanded {
             col = col.child(
                 div()
-                    .pl(px(72.))
+                    .ml(px(20.))
+                    .p_3()
+                    .rounded(px(8.))
+                    .bg(rgba(0x8a8a8a14))
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(text.to_string()),
@@ -339,36 +387,24 @@ impl AgentApp {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let glyph = if expanded { "▾" } else { "▸" };
         let adds = text.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
         let dels = text.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
 
-        let header = h_flex()
-            .id(("diff", i))
-            .gap_2()
-            .items_start()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _ev, _window, cx| {
+        let header = self.collapsible_header(
+            ("diff", i),
+            expanded,
+            "DIFF",
+            rgb(0x58a6ff).into(),
+            format!("{path}   +{adds} -{dels}"),
+            theme.foreground,
+            cx,
+            move |this, cx| {
                 if let Some(Line::Diff { expanded, .. }) = this.lines.get_mut(i) {
                     *expanded = !*expanded;
                     cx.notify();
                 }
-            }))
-            .child(
-                div()
-                    .w(px(64.))
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{glyph} diff")),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .text_sm()
-                    .text_color(theme.foreground)
-                    .child(format!("{path}  +{adds} -{dels}")),
-            );
+            },
+        );
 
         let mut col = v_flex().gap_1().child(header);
         if expanded {
@@ -391,7 +427,10 @@ impl AgentApp {
                 .collect();
             col = col.child(
                 v_flex()
-                    .pl(px(72.))
+                    .ml(px(20.))
+                    .p_3()
+                    .rounded(px(8.))
+                    .bg(rgba(0x0d11171f))
                     .font_family(cx.theme().mono_font_family.clone())
                     .children(rows),
             );
@@ -423,67 +462,92 @@ impl Render for AgentApp {
             })
             .collect();
 
-        v_flex()
-            .size_full()
-            .p_4()
-            .gap_3()
-            .bg(theme.background)
-            // 标题栏: 标题 + (状态 + New chat)
+        // 全屏背景, 内容居中收进一个最大宽度的阅读列 (宽窗也不至于撑满、留出舒适留白)。
+        v_flex().size_full().bg(theme.background).items_center().child(
+            v_flex()
+                .size_full()
+                .max_w(px(880.))
+                .px_6()
+                .py_5()
+                .gap_4()
+                .child(self.render_header(running, cx))
+                // transcript (可滚动, 占满中间)
+                .child(
+                    v_flex()
+                        .id("transcript")
+                        .flex_1()
+                        .gap_3()
+                        .pr_2()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .children(rows),
+                )
+                // 审批卡片 (仅在有在途 Ask 请求时): 阻塞中, 等人点 Allow once / Deny。
+                .children(self.pending_approval.as_ref().map(|p| self.render_approval(p, cx)))
+                .child(self.render_input(running, cx)),
+        )
+    }
+}
+
+impl AgentApp {
+    /// 顶栏: 标题 + 副标题 / 状态点 + New chat。底部细分隔线。
+    fn render_header(&self, running: bool, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let dot: Hsla = if running { rgb(0x3fb950).into() } else { theme.muted_foreground };
+        let status = if running { "running" } else { "idle" };
+        h_flex()
+            .justify_between()
+            .items_center()
+            .pb_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                v_flex()
+                    .child(div().text_lg().font_bold().text_color(theme.foreground).child("SynCode"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("autonomous coding agent"),
+                    ),
+            )
             .child(
                 h_flex()
-                    .justify_between()
+                    .gap_3()
                     .items_center()
-                    .child(div().text_lg().font_bold().child("SynCode"))
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(if running { "running…" } else { "idle" }),
-                            )
-                            .child(
-                                Button::new("new-chat")
-                                    .ghost()
-                                    .label("New chat")
-                                    .disabled(running)
-                                    .on_click(
-                                        cx.listener(|this, _ev, window, cx| this.new_chat(window, cx)),
-                                    ),
-                            ),
-                    ),
-            )
-            // transcript (可滚动)
-            .child(
-                v_flex()
-                    .id("transcript")
-                    .flex_1()
-                    .gap_2()
-                    .p_3()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(px(6.))
-                    .children(rows),
-            )
-            // 审批卡片 (仅在有在途 Ask 请求时): 阻塞中, 等人点 Allow once / Deny。
-            .children(self.pending_approval.as_ref().map(|p| self.render_approval(p, cx)))
-            // 输入行: 文本框 + Send
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(TextInput::new(&self.input).flex_1())
+                            .child(div().size(px(8.)).rounded_full().bg(dot))
+                            .child(div().text_xs().text_color(theme.muted_foreground).child(status)),
+                    )
                     .child(
-                        Button::new("send")
-                            .primary()
-                            .label(if running { "…" } else { "Send" })
+                        Button::new("new-chat")
+                            .ghost()
+                            .label("New chat")
                             .disabled(running)
-                            .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx))),
+                            .on_click(cx.listener(|this, _ev, window, cx| this.new_chat(window, cx))),
                     ),
+            )
+    }
+
+    /// 底部输入行: 文本框 + Send, 顶部细分隔线。
+    fn render_input(&self, running: bool, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        h_flex()
+            .gap_2()
+            .items_center()
+            .pt_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(TextInput::new(&self.input).flex_1())
+            .child(
+                Button::new("send")
+                    .primary()
+                    .label(if running { "…" } else { "Send" })
+                    .disabled(running)
+                    .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx))),
             )
     }
 }
@@ -496,16 +560,23 @@ impl AgentApp {
         let what = p.req.target.clone().unwrap_or_else(|| p.req.tool.clone());
         let class = format!("{:?}", p.req.class);
         v_flex()
-            .gap_2()
-            .p_3()
+            .gap_3()
+            .p_4()
             .border_1()
             .border_color(theme.danger)
-            .rounded(px(6.))
+            .bg(rgba(0xf8514915))
+            .rounded(px(10.))
             .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.foreground)
-                    .child(format!("⚠ Approve a {class} action?  ({what})")),
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_bold()
+                            .text_color(theme.danger)
+                            .child(format!("⚠ APPROVAL NEEDED · {class}")),
+                    )
+                    .child(div().text_sm().text_color(theme.foreground).child(what)),
             )
             .child(
                 h_flex()
@@ -637,7 +708,19 @@ fn main() {
         thread::spawn(move || run_agent_worker(task_rx, event_tx, appr_tx));
 
         cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
+            let bounds = Bounds {
+                origin: point(px(140.), px(90.)),
+                size: size(px(1040.), px(740.)),
+            };
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("SynCode".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            cx.open_window(options, |window, cx| {
                 let view = cx.new(|cx| AgentApp::new(task_tx, event_rx, appr_rx, window, cx));
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
