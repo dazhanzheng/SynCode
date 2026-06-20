@@ -32,8 +32,8 @@ use syncode_llm::wire::{
 pub enum AgentEvent {
     /// 模型本轮可见文本 (assistant content)。
     AssistantText(String),
-    /// 模型本轮有推理 (CoT); 只报字符数, 不传全文。
-    Reasoning { chars: usize },
+    /// 模型本轮的推理 (CoT) 全文; UI 自行折叠/截断展示。
+    Reasoning { text: String },
     /// 一个工具即将执行。
     ToolStarted { name: String, args: String },
     /// 工具返回 (完整结果文本; UI 自行决定折叠/截断展示)。
@@ -212,10 +212,10 @@ impl AgentLoop {
             // assistant 全文 (含完整 reasoning_content) 回填 canonical。裁切只在发送投影侧做 (D1)。
             let tool_calls = message.tool_calls.clone().unwrap_or_default();
             let content = message.content.clone().unwrap_or_default();
-            let reasoning_chars = message.reasoning_content.as_deref().map(str::len).unwrap_or(0);
+            let reasoning_text = message.reasoning_content.clone().unwrap_or_default();
             self.commit(session, message);
-            if reasoning_chars > 0 {
-                self.emit(AgentEvent::Reasoning { chars: reasoning_chars });
+            if !reasoning_text.trim().is_empty() {
+                self.emit(AgentEvent::Reasoning { text: reasoning_text });
             }
             if !content.trim().is_empty() {
                 self.emit(AgentEvent::AssistantText(content.clone()));

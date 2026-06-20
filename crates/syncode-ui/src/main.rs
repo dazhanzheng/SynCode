@@ -40,7 +40,8 @@ enum Line {
     /// 一次工具调用 (一行, 可折叠): `args` 完整, `result` 在 finish 前为 None (运行中)。
     /// 折叠时显示 name + 结果摘要; 展开 (`expanded`) 显示完整 args + result。
     Tool { name: String, args: String, result: Option<String>, ok: bool, expanded: bool },
-    Reasoning(usize),
+    /// 本轮推理 (CoT) 全文, 可折叠: 折叠显示摘要, 展开显示完整链。
+    Reasoning { text: String, expanded: bool },
     Status(String),
 }
 
@@ -99,7 +100,9 @@ impl AgentApp {
     fn apply(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::AssistantText(t) => self.lines.push(Line::Assistant(t)),
-            AgentEvent::Reasoning { chars } => self.lines.push(Line::Reasoning(chars)),
+            AgentEvent::Reasoning { text } => {
+                self.lines.push(Line::Reasoning { text, expanded: false })
+            }
             AgentEvent::ToolStarted { name, args } => {
                 self.lines.push(Line::Tool { name, args, result: None, ok: true, expanded: false })
             }
@@ -160,7 +163,8 @@ impl AgentApp {
                 format!("{name}  {}", result.as_deref().unwrap_or("…")),
                 if *ok { theme.muted_foreground } else { theme.danger },
             ),
-            Line::Reasoning(n) => ("think", format!("(reasoning: {n} chars)"), theme.muted_foreground),
+            // Reasoning 实际走 render_reasoning (可折叠); 此分支仅为 match 完备的兜底。
+            Line::Reasoning { text, .. } => ("think", truncate(text, 120), theme.muted_foreground),
             Line::Status(t) => ("·", t.clone(), theme.muted_foreground),
         };
         h_flex()
@@ -233,6 +237,52 @@ impl AgentApp {
         }
         col
     }
+
+    /// 可折叠推理行: header (▸/▾ think + 摘要); 展开时下方显示完整 CoT。同 render_tool 的点击模型。
+    fn render_reasoning(
+        &self,
+        i: usize,
+        text: &str,
+        expanded: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let glyph = if expanded { "▾" } else { "▸" };
+        let summary = truncate(text, 120);
+
+        let header = h_flex()
+            .id(("reasoning", i))
+            .gap_2()
+            .items_start()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _ev, _window, cx| {
+                if let Some(Line::Reasoning { expanded, .. }) = this.lines.get_mut(i) {
+                    *expanded = !*expanded;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .w(px(64.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("{glyph} think")),
+            )
+            .child(div().flex_1().text_sm().text_color(theme.muted_foreground).child(summary));
+
+        let mut col = v_flex().gap_1().child(header);
+        if expanded {
+            col = col.child(
+                div()
+                    .pl(px(72.))
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(text.to_string()),
+            );
+        }
+        col
+    }
 }
 
 impl Render for AgentApp {
@@ -248,6 +298,9 @@ impl Render for AgentApp {
                 Line::Tool { name, args, result, ok, expanded } => self
                     .render_tool(i, name, args, result.as_deref(), *ok, *expanded, cx)
                     .into_any_element(),
+                Line::Reasoning { text, expanded } => {
+                    self.render_reasoning(i, text, *expanded, cx).into_any_element()
+                }
                 other => self.render_line(other, cx).into_any_element(),
             })
             .collect();
