@@ -7,14 +7,16 @@
 //!
 //! 本 MVP 用一个按钮跑**只读**演示任务 (不改仓库, 安全); 文本输入框留作下一步。
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
 
 use gpui::*;
 use gpui_component::input::{Input as TextInput, InputEvent, InputState};
 use gpui_component::{button::*, *};
-use syncode_core::permission::PolicyApprover;
-use syncode_core::{AgentEvent, AgentLoop, EventSink, FsScope, Session, ToolRegistry};
+use syncode_core::permission::{ActionRequest, Decision, PolicyApprover};
+use syncode_core::{AgentEvent, AgentLoop, AskGate, EventSink, FsScope, Session, ToolRegistry};
 use syncode_llm::{DeepSeekClient, DeepSeekConfig};
 use syncode_tools::register_builtins;
 
@@ -30,6 +32,14 @@ const SYSTEM_PROMPT: &str = "You are SynCode, an autonomous coding agent in a Ru
 enum WorkerMsg {
     Task(String),
     Reset,
+}
+
+/// 交互审批请求 (worker → UI): 当策略审批器判 `Ask` 时, AskGate 把它发给 UI 并 await `reply`。
+/// `reply` 收到 `Allow`/`Deny` 即解阻塞; 若 UI 关窗/丢弃 (reply Sender 随之 drop), worker 侧
+/// `recv` 报错 → 兜底 `Deny` (fail-closed)。
+struct ApprovalRequest {
+    req: ActionRequest,
+    reply: smol::channel::Sender<Decision>,
 }
 
 /// transcript 一行。
@@ -49,15 +59,19 @@ struct AgentApp {
     lines: Vec<Line>,
     input: Entity<InputState>,
     task_tx: smol::channel::Sender<WorkerMsg>,
+    /// 在途审批请求 (Some 时渲染审批卡片, 阻塞 agent 直到人点 Allow/Deny)。
+    pending_approval: Option<ApprovalRequest>,
     running: bool,
     scroll: ScrollHandle,
     _drain: Task<()>,
+    _appr_drain: Task<()>,
 }
 
 impl AgentApp {
     fn new(
         task_tx: smol::channel::Sender<WorkerMsg>,
         event_rx: smol::channel::Receiver<AgentEvent>,
+        appr_rx: smol::channel::Receiver<ApprovalRequest>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -87,14 +101,36 @@ impl AgentApp {
                 }
             }
         });
+        // 抽干审批请求流 → 置 pending_approval (渲染审批卡片)。
+        let appr_drain = cx.spawn(async move |weak, cx| {
+            while let Ok(request) = appr_rx.recv().await {
+                let updated = weak.update(cx, |this, cx| {
+                    this.pending_approval = Some(request);
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             lines: vec![Line::Status("Ready — edit the task and press Enter (or Send).".into())],
             input,
             task_tx,
+            pending_approval: None,
             running: false,
             scroll: ScrollHandle::new(),
             _drain: drain,
+            _appr_drain: appr_drain,
         }
+    }
+
+    /// 人对在途审批请求作答: 把决定回送给 worker (解阻塞 agent), 清掉卡片。
+    fn resolve_approval(&mut self, decision: Decision, cx: &mut Context<Self>) {
+        if let Some(p) = self.pending_approval.take() {
+            let _ = p.reply.try_send(decision);
+        }
+        cx.notify();
     }
 
     fn apply(&mut self, event: AgentEvent) {
@@ -351,6 +387,8 @@ impl Render for AgentApp {
                     .rounded(px(6.))
                     .children(rows),
             )
+            // 审批卡片 (仅在有在途 Ask 请求时): 阻塞中, 等人点 Allow once / Deny。
+            .children(self.pending_approval.as_ref().map(|p| self.render_approval(p, cx)))
             // 输入行: 文本框 + Send
             .child(
                 h_flex()
@@ -363,6 +401,48 @@ impl Render for AgentApp {
                             .label(if running { "…" } else { "Send" })
                             .disabled(running)
                             .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx))),
+                    ),
+            )
+    }
+}
+
+impl AgentApp {
+    /// 审批卡片: 显示「Approve {class} action? ({target})」+ Allow once / Deny。点击经
+    /// [`resolve_approval`](Self::resolve_approval) 把决定回送 worker (解阻塞 agent)。
+    fn render_approval(&self, p: &ApprovalRequest, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let what = p.req.target.clone().unwrap_or_else(|| p.req.tool.clone());
+        let class = format!("{:?}", p.req.class);
+        v_flex()
+            .gap_2()
+            .p_3()
+            .border_1()
+            .border_color(theme.danger)
+            .rounded(px(6.))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(format!("⚠ Approve a {class} action?  ({what})")),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("appr-allow")
+                            .primary()
+                            .label("Allow once")
+                            .on_click(cx.listener(|this, _ev, _window, cx| {
+                                this.resolve_approval(Decision::Allow, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("appr-deny")
+                            .danger()
+                            .label("Deny")
+                            .on_click(cx.listener(|this, _ev, _window, cx| {
+                                this.resolve_approval(Decision::Deny, cx)
+                            })),
                     ),
             )
     }
@@ -383,6 +463,7 @@ fn truncate(s: &str, n: usize) -> String {
 fn run_agent_worker(
     task_rx: smol::channel::Receiver<WorkerMsg>,
     event_tx: smol::channel::Sender<AgentEvent>,
+    appr_tx: smol::channel::Sender<ApprovalRequest>,
 ) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -423,11 +504,24 @@ fn run_agent_worker(
         let sink: EventSink = Arc::new(move |e| {
             let _ = sink_tx.try_send(e);
         });
+        // Ask 升级钩子: 把审批请求发给 UI + await 回信。发送失败 / 通道断 → 兜底 Deny (fail-closed)。
+        let gate: AskGate = Arc::new(move |req: ActionRequest| {
+            let appr_tx = appr_tx.clone();
+            let fut: Pin<Box<dyn Future<Output = Decision> + Send>> = Box::pin(async move {
+                let (reply_tx, reply_rx) = smol::channel::bounded::<Decision>(1);
+                if appr_tx.try_send(ApprovalRequest { req, reply: reply_tx }).is_err() {
+                    return Decision::Deny; // UI 没了
+                }
+                reply_rx.recv().await.unwrap_or(Decision::Deny) // 通道断 / 关窗
+            });
+            fut
+        });
         let mut agent = AgentLoop::new(Arc::new(client), registry)
             .with_approver(Arc::new(PolicyApprover::new(&root)))
             .with_fs_scope(Some(Arc::new(FsScope::new(&root))))
             .with_cwd(&root)
-            .with_event_sink(sink);
+            .with_event_sink(sink)
+            .with_ask_gate(gate);
 
         // 常驻 session: 循环外建一次, 跨任务累积 (多轮上下文)。Reset 时整体重建。
         let mut session = Session::with_system(SYSTEM_PROMPT);
@@ -455,13 +549,14 @@ fn main() {
 
         let (task_tx, task_rx) = smol::channel::unbounded::<WorkerMsg>();
         let (event_tx, event_rx) = smol::channel::unbounded::<AgentEvent>();
+        let (appr_tx, appr_rx) = smol::channel::unbounded::<ApprovalRequest>();
 
         // agent worker 独立线程 (自带 tokio runtime)。
-        thread::spawn(move || run_agent_worker(task_rx, event_tx));
+        thread::spawn(move || run_agent_worker(task_rx, event_tx, appr_tx));
 
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|cx| AgentApp::new(task_tx, event_rx, window, cx));
+                let view = cx.new(|cx| AgentApp::new(task_tx, event_rx, appr_rx, window, cx));
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .expect("failed to open window");

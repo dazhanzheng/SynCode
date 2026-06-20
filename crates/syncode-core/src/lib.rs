@@ -22,7 +22,7 @@ pub mod session;
 pub mod state;
 pub mod tool;
 
-pub use agent::{AgentEvent, AgentLoop, EventSink};
+pub use agent::{AgentEvent, AgentLoop, AskGate, EventSink};
 pub use background::{BackgroundRegistry, BackgroundTask, TaskState};
 pub use context::ContextManager;
 pub use file_state::{FileState, FileStateCache};

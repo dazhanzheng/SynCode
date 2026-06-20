@@ -16,7 +16,9 @@ use crate::registry::ToolRegistry;
 use crate::session::Session;
 use crate::state::SessionStore;
 use crate::tool::ToolCtx;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use syncode_lsp::LspManager;
 use syncode_llm::client::{DeepSeekClient, MODEL};
@@ -45,6 +47,18 @@ pub enum AgentEvent {
 /// 事件回调汇 (在 agent 的 async 上下文里**同步**调用; 实现应是非阻塞的, 如往 channel 投递)。
 pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
+/// Ask 升级钩子 (交互档审批, §5.1): 当**同步**策略审批器判 `Ask` 且装了此钩子时, agent `await`
+/// 它拿人的裁决 (只会是 Allow/Deny —— Allow once)。**无钩子 = `Ask` fail-closed 拒** (headless /
+/// CLI 行为零变化)。策略审批器仍是权威, 此钩子只处理 `Ask` 档的「叫人」升级。
+///
+/// 用 `Pin<Box<dyn Future>>` 而非 async-trait, 避免引第三方 future 依赖; 返回的 future 必须 `Send`
+/// (agent 跑在多线程 tokio runtime)。UI 实现里它通常: 发审批请求给 UI + await 一个回信通道。
+pub type AskGate = Arc<
+    dyn Fn(crate::permission::ActionRequest) -> Pin<Box<dyn Future<Output = Decision> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// 一个 turn 的自建循环: 投影裁切 → 请求 → 若 `tool_calls` 则分发执行 → 回填 → 直到 `stop`。
 pub struct AgentLoop {
     client: Arc<DeepSeekClient>,
@@ -64,6 +78,8 @@ pub struct AgentLoop {
     cwd: PathBuf,
     /// 可选进度事件汇 (UI 流式渲染)。无则不发事件 (headless / 测试)。
     events: Option<EventSink>,
+    /// 可选 Ask 升级钩子 (交互档审批): 策略审批器判 `Ask` 时 await 它拿人的裁决。无则 `Ask` fail-closed。
+    ask_gate: Option<AskGate>,
     /// 可选持久化 (D2/D4)。无则纯内存。
     store: Option<SessionStore>,
     session_id: String,
@@ -82,6 +98,7 @@ impl AgentLoop {
             background: Arc::new(BackgroundRegistry::new()),
             cwd: std::env::current_dir().unwrap_or_default(),
             events: None,
+            ask_gate: None,
             store: None,
             session_id: "default".to_string(),
         }
@@ -95,6 +112,13 @@ impl AgentLoop {
     /// 注入进度事件汇 (UI 流式渲染): 每段 assistant 文本 / 每次工具起止都会回调一次。
     pub fn with_event_sink(mut self, sink: EventSink) -> Self {
         self.events = Some(sink);
+        self
+    }
+
+    /// 注入 Ask 升级钩子 (交互档审批): 策略审批器判 `Ask` 时 agent `await` 它拿人的裁决 (Allow once)。
+    /// 无此钩子时 `Ask` 维持 fail-closed 拒。
+    pub fn with_ask_gate(mut self, gate: AskGate) -> Self {
+        self.ask_gate = Some(gate);
         self
     }
 
@@ -282,13 +306,31 @@ impl AgentLoop {
                     );
                 }
                 Decision::Ask => {
-                    let what = req.target.as_deref().unwrap_or(name);
-                    return format!(
-                        "<tool_use_error>{name} needs human approval for a {:?} action ({what}), but \
-                         interactive approval is not wired up yet, so it was refused. If this is safe and \
-                         intended, pre-authorize it in the approver policy (e.g. an allowed write root).</tool_use_error>",
-                        req.class
-                    );
+                    // Ask 升级 (§5.1): 装了交互钩子 → await 人的裁决 (Allow once); 无钩子 → fail-closed 拒。
+                    // 钩子返回非 Allow (含人点 Deny / 窗口关 / 通道断 → 钩子兜底成 Deny) 一律不放行。
+                    let granted = match &self.ask_gate {
+                        Some(gate) => gate(req.clone()).await == Decision::Allow,
+                        None => false,
+                    };
+                    if !granted {
+                        let what = req.target.as_deref().unwrap_or(name);
+                        return match self.ask_gate {
+                            // 有交互通道但被拒 (人 Deny / 超时 / 关窗)。
+                            Some(_) => format!(
+                                "<tool_use_error>{name} needs human approval for a {:?} action ({what}); \
+                                 the user did not approve it, so it was refused.</tool_use_error>",
+                                req.class
+                            ),
+                            // 无交互通道 → fail-closed (headless / CLI)。
+                            None => format!(
+                                "<tool_use_error>{name} needs human approval for a {:?} action ({what}), but \
+                                 interactive approval is not wired up here, so it was refused. If this is safe and \
+                                 intended, pre-authorize it in the approver policy (e.g. an allowed write root).</tool_use_error>",
+                                req.class
+                            ),
+                        };
+                    }
+                    // granted → 落到下方正常执行。
                 }
             }
         }
@@ -444,6 +486,32 @@ mod tests {
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "dangerous tool must NOT execute on Ask"
         );
+    }
+
+    #[tokio::test]
+    async fn ask_gate_allow_lets_tool_execute() {
+        // Ask + 交互钩子返回 Allow (人批本次) → 工具真执行。
+        let (tool, ran) = class_tool(crate::permission::ActionClass::ArbitraryExec, None);
+        let gate: AskGate = Arc::new(|_req| Box::pin(async { Decision::Allow }));
+        let agent = AgentLoop::new(dummy_client(), registry_with(tool))
+            .with_approver(Arc::new(AskAll))
+            .with_ask_gate(gate);
+        let out = agent.dispatch_tool(&call("danger", "{}")).await;
+        assert_eq!(out, "ran", "human-approved Ask must execute");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn ask_gate_deny_refuses_and_does_not_execute() {
+        // Ask + 交互钩子返回 Deny (人拒 / 关窗 / 超时兜底) → 不执行, 报「未获批准」。
+        let (tool, ran) = class_tool(crate::permission::ActionClass::ArbitraryExec, None);
+        let gate: AskGate = Arc::new(|_req| Box::pin(async { Decision::Deny }));
+        let agent = AgentLoop::new(dummy_client(), registry_with(tool))
+            .with_approver(Arc::new(AskAll))
+            .with_ask_gate(gate);
+        let out = agent.dispatch_tool(&call("danger", "{}")).await;
+        assert!(out.contains("did not approve"), "got: {out}");
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst), "denied Ask must NOT execute");
     }
 
     #[tokio::test]
