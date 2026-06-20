@@ -22,6 +22,16 @@ use syncode_tools::register_builtins;
 const DEMO_TASK: &str = "Read the file crates/syncode-core/src/tool.rs and briefly summarize what \
     the `Tool` trait requires implementors to provide. Be concise.";
 
+/// agent worker 的 system prompt (常驻 session 起头, 固定在前缀以吃 prompt cache, §12)。
+const SYSTEM_PROMPT: &str = "You are SynCode, an autonomous coding agent in a Rust workspace. Use \
+    absolute paths. Locate code with Grep/Read before answering. Be concise.";
+
+/// UI → worker 的控制消息。Task 跑一轮 (累积进常驻 session); Reset 丢弃 session 开新会话。
+enum WorkerMsg {
+    Task(String),
+    Reset,
+}
+
 /// transcript 一行。
 #[derive(Clone)]
 enum Line {
@@ -35,7 +45,7 @@ enum Line {
 struct AgentApp {
     lines: Vec<Line>,
     input: Entity<InputState>,
-    task_tx: smol::channel::Sender<String>,
+    task_tx: smol::channel::Sender<WorkerMsg>,
     running: bool,
     scroll: ScrollHandle,
     _drain: Task<()>,
@@ -43,7 +53,7 @@ struct AgentApp {
 
 impl AgentApp {
     fn new(
-        task_tx: smol::channel::Sender<String>,
+        task_tx: smol::channel::Sender<WorkerMsg>,
         event_rx: smol::channel::Receiver<AgentEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -112,8 +122,19 @@ impl AgentApp {
         }
         self.lines.push(Line::User(task.clone()));
         self.running = true;
-        let _ = self.task_tx.try_send(task);
+        let _ = self.task_tx.try_send(WorkerMsg::Task(task));
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// 开新会话: 通知 worker 丢弃常驻 session, 清空本地 transcript。只在 idle 时可点 (render 已 disable),
+    /// 故 worker 此刻阻塞于 recv, Reset 会被立刻处理, 不与在途事件流交错。
+    fn new_chat(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        let _ = self.task_tx.try_send(WorkerMsg::Reset);
+        self.lines = vec![Line::Status("New chat — context cleared.".into())];
         cx.notify();
     }
 
@@ -149,17 +170,31 @@ impl Render for AgentApp {
             .p_4()
             .gap_3()
             .bg(theme.background)
-            // 标题栏
+            // 标题栏: 标题 + (状态 + New chat)
             .child(
                 h_flex()
                     .justify_between()
                     .items_center()
                     .child(div().text_lg().font_bold().child("SynCode"))
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(if running { "running…" } else { "idle" }),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if running { "running…" } else { "idle" }),
+                            )
+                            .child(
+                                Button::new("new-chat")
+                                    .ghost()
+                                    .label("New chat")
+                                    .disabled(running)
+                                    .on_click(
+                                        cx.listener(|this, _ev, window, cx| this.new_chat(window, cx)),
+                                    ),
+                            ),
                     ),
             )
             // transcript (可滚动)
@@ -203,9 +238,10 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// agent worker: 独立线程 + tokio runtime; 收到任务就跑一个 turn, 事件经 sink 流回 UI。
+/// agent worker: 独立线程 + tokio runtime; 持一个**常驻 session** 跨任务累积上下文 (多轮)。
+/// 收到 `Task` 就把它 push 进 session 跑一个 turn; 收到 `Reset` 丢弃 session 开新会话。
 fn run_agent_worker(
-    task_rx: smol::channel::Receiver<String>,
+    task_rx: smol::channel::Receiver<WorkerMsg>,
     event_tx: smol::channel::Sender<AgentEvent>,
 ) {
     let rt = match tokio::runtime::Runtime::new() {
@@ -223,10 +259,12 @@ fn run_agent_worker(
                     "DEEPSEEK_API_KEY not set — load it before launching to run live.".into(),
                 ));
                 let _ = event_tx.try_send(AgentEvent::TurnDone);
-                // 仍消费任务队列, 每个都报同样的提示。
-                while task_rx.recv().await.is_ok() {
-                    let _ = event_tx.try_send(AgentEvent::AssistantText("(no API key)".into()));
-                    let _ = event_tx.try_send(AgentEvent::TurnDone);
+                // 仍消费任务队列, 每个 Task 都报同样的提示 (Reset 静默忽略)。
+                while let Ok(msg) = task_rx.recv().await {
+                    if let WorkerMsg::Task(_) = msg {
+                        let _ = event_tx.try_send(AgentEvent::AssistantText("(no API key)".into()));
+                        let _ = event_tx.try_send(AgentEvent::TurnDone);
+                    }
                 }
                 return;
             }
@@ -251,15 +289,21 @@ fn run_agent_worker(
             .with_cwd(&root)
             .with_event_sink(sink);
 
-        while let Ok(task) = task_rx.recv().await {
-            let mut session = Session::with_system(
-                "You are SynCode, an autonomous coding agent in a Rust workspace. Use absolute \
-                 paths. Locate code with Grep/Read before answering. Be concise.",
-            );
-            session.push_user(&task);
-            if let Err(e) = agent.run_turn(&mut session).await {
-                let _ = event_tx.try_send(AgentEvent::AssistantText(format!("⚠ turn error: {e}")));
-                let _ = event_tx.try_send(AgentEvent::TurnDone);
+        // 常驻 session: 循环外建一次, 跨任务累积 (多轮上下文)。Reset 时整体重建。
+        let mut session = Session::with_system(SYSTEM_PROMPT);
+        while let Ok(msg) = task_rx.recv().await {
+            match msg {
+                WorkerMsg::Reset => {
+                    session = Session::with_system(SYSTEM_PROMPT);
+                }
+                WorkerMsg::Task(task) => {
+                    session.push_user(&task);
+                    if let Err(e) = agent.run_turn(&mut session).await {
+                        let _ = event_tx
+                            .try_send(AgentEvent::AssistantText(format!("⚠ turn error: {e}")));
+                        let _ = event_tx.try_send(AgentEvent::TurnDone);
+                    }
+                }
             }
         }
     });
@@ -269,7 +313,7 @@ fn main() {
     gpui_platform::application().run(move |cx| {
         gpui_component::init(cx);
 
-        let (task_tx, task_rx) = smol::channel::unbounded::<String>();
+        let (task_tx, task_rx) = smol::channel::unbounded::<WorkerMsg>();
         let (event_tx, event_rx) = smol::channel::unbounded::<AgentEvent>();
 
         // agent worker 独立线程 (自带 tokio runtime)。
