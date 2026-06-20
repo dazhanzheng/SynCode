@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 use gpui::*;
+use gpui_component::input::{Input as TextInput, InputEvent, InputState};
 use gpui_component::{button::*, *};
 use syncode_core::permission::PolicyApprover;
 use syncode_core::{AgentEvent, AgentLoop, EventSink, FsScope, Session, ToolRegistry};
@@ -33,6 +34,7 @@ enum Line {
 
 struct AgentApp {
     lines: Vec<Line>,
+    input: Entity<InputState>,
     task_tx: smol::channel::Sender<String>,
     running: bool,
     scroll: ScrollHandle,
@@ -43,8 +45,23 @@ impl AgentApp {
     fn new(
         task_tx: smol::channel::Sender<String>,
         event_rx: smol::channel::Receiver<AgentEvent>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // 输入框: 预填演示任务 (可清空改写); 单行, Enter 提交。
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Type a task for the agent… (Enter to run)")
+                .default_value(DEMO_TASK)
+        });
+        // Enter → 提交 (subscribe_in 给 window, 才能清空输入框)。
+        cx.subscribe_in(&input, window, |this, _input, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.submit(window, cx);
+            }
+        })
+        .detach();
+
         // 抽干 agent 事件流 → 更新 view。
         let drain = cx.spawn(async move |weak, cx| {
             while let Ok(event) = event_rx.recv().await {
@@ -58,7 +75,8 @@ impl AgentApp {
             }
         });
         Self {
-            lines: vec![Line::Status("Ready — click Run to start the demo task.".into())],
+            lines: vec![Line::Status("Ready — edit the task and press Enter (or Send).".into())],
+            input,
             task_tx,
             running: false,
             scroll: ScrollHandle::new(),
@@ -84,13 +102,18 @@ impl AgentApp {
         self.scroll.scroll_to_bottom();
     }
 
-    fn run(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.running {
             return;
         }
-        self.lines.push(Line::User(DEMO_TASK.to_string()));
+        let task = self.input.read(cx).value().trim().to_string();
+        if task.is_empty() {
+            return;
+        }
+        self.lines.push(Line::User(task.clone()));
         self.running = true;
-        let _ = self.task_tx.try_send(DEMO_TASK.to_string());
+        let _ = self.task_tx.try_send(task);
+        self.input.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
     }
 
@@ -133,11 +156,10 @@ impl Render for AgentApp {
                     .items_center()
                     .child(div().text_lg().font_bold().child("SynCode"))
                     .child(
-                        Button::new("run")
-                            .primary()
-                            .label(if running { "Running…" } else { "Run demo task" })
-                            .disabled(running)
-                            .on_click(cx.listener(|this, _ev, window, cx| this.run(window, cx))),
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(if running { "running…" } else { "idle" }),
                     ),
             )
             // transcript (可滚动)
@@ -153,6 +175,20 @@ impl Render for AgentApp {
                     .border_color(theme.border)
                     .rounded(px(6.))
                     .children(rows),
+            )
+            // 输入行: 文本框 + Send
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(TextInput::new(&self.input).flex_1())
+                    .child(
+                        Button::new("send")
+                            .primary()
+                            .label(if running { "…" } else { "Send" })
+                            .disabled(running)
+                            .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx))),
+                    ),
             )
     }
 }
@@ -241,7 +277,7 @@ fn main() {
 
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|cx| AgentApp::new(task_tx, event_rx, cx));
+                let view = cx.new(|cx| AgentApp::new(task_tx, event_rx, window, cx));
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .expect("failed to open window");
