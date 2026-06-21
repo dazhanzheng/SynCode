@@ -25,6 +25,17 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// 取一个只含给定名字的工具子集 (子 agent 限权用, 如只读 explore)。未知名字忽略。
+    pub fn subset(&self, keep: &[&str]) -> ToolRegistry {
+        let mut r = ToolRegistry::new();
+        for name in keep {
+            if let Some(t) = self.tools.get(*name) {
+                r.tools.insert(t.name().to_string(), t.clone());
+            }
+        }
+        r
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }
@@ -46,5 +57,43 @@ impl ToolRegistry {
             .into_iter()
             .filter_map(|n| self.tools.get(&n).map(|t| t.to_def()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::{Tool, ToolCtx, ToolError, ToolOutput};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    struct Named(&'static str);
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "x"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{},"additionalProperties":false})
+        }
+        async fn call(&self, _a: Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("ok"))
+        }
+    }
+
+    #[test]
+    fn subset_keeps_only_named_tools() {
+        let mut reg = ToolRegistry::new();
+        for n in ["Read", "Grep", "Write", "Bash"] {
+            reg.register(Arc::new(Named(n)));
+        }
+        // 只读子集 (explore/review 限权): 写/执行类被滤掉。
+        let ro = reg.subset(&["Read", "Grep", "Nonexistent"]);
+        assert_eq!(ro.names(), vec!["Grep".to_string(), "Read".to_string()]);
+        assert!(ro.get("Write").is_none(), "Write must be filtered out of a read-only subset");
+        assert!(ro.get("Bash").is_none());
     }
 }

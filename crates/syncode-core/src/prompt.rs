@@ -107,15 +107,26 @@ items as owner/repo#123. No emojis unless asked.",
 
 /// 子 agent 的 system prompt (§5 编排): 在共享纲领之上, 说明它是被派来做**一个聚焦子任务**的子 agent,
 /// 产出是给**编排者**消费的简洁结果 (不是给最终用户), 且自身不能再派子 agent。
-pub fn sub_agent_prompt(root: &Path) -> String {
+/// `agent_type`: `None`/"general" = 全权执行; "explore"/"review" = 只读 (无 write/exec 工具) + 各自定制。
+pub fn sub_agent_prompt(root: &Path, agent_type: Option<&str>) -> String {
+    let role = match agent_type {
+        Some("explore") => "You are an EXPLORE sub-agent — read-only. You have search and read tools \
+(Read/Grep/Glob/AstGrep/Lsp) and NO write or execute tools. Investigate and answer the question, \
+then return precise findings the orchestrator can act on: exact file paths, symbol names, the \
+relevant snippets, and line numbers. Do not speculate beyond what you read.",
+        Some("review") => "You are a REVIEW sub-agent — read-only. You have search and read tools \
+(Read/Grep/Glob/AstGrep/Lsp) and NO write or execute tools. Examine the code for bugs, correctness \
+issues, security risks, and convention violations, then return concrete findings: each with \
+file:line, what's wrong, and a severity. Report only what you can substantiate from the code.",
+        _ => "You were spawned by an orchestrating agent to complete one focused sub-task, then \
+return. Do the task fully and autonomously with the tools available, then give a concise, factual \
+result for the ORCHESTRATOR to consume — not a chat reply for an end user. Lead with the answer or \
+what you did and what you found (file paths, symbols, values it will need); include only what the \
+orchestrator needs to proceed.",
+    };
     format!(
-        "{base}\n\n\
-# You are a sub-agent\n\
-You were spawned by an orchestrating agent to complete one focused sub-task, then return. \
-Do the task fully and autonomously with the tools available, then give a concise, factual result \
-for the ORCHESTRATOR to consume — not a chat reply for an end user. Lead with the answer or what you \
-did and what you found (file paths, symbols, values it will need); include only what the orchestrator \
-needs to proceed. You cannot spawn further sub-agents, so do the work yourself.",
+        "{base}\n\n# You are a sub-agent\n{role} You cannot spawn further sub-agents, so do the work \
+yourself.",
         base = system_prompt(root)
     )
 }

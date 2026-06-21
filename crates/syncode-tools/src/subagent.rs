@@ -26,9 +26,13 @@ impl Tool for SubAgentTool {
          - description: a short label for the sub-task.\n\
          - prompt: the full, self-contained instructions for the sub-agent (it does not see this \
          conversation, so include everything it needs).\n\
-         The sub-agent has the same tools and the same workspace confinement as you, runs \
-         autonomously to completion, and cannot itself spawn further sub-agents. Prefer doing small \
-         tasks yourself; reach for Task when delegating genuinely saves context or parallelizes work."
+         - subagent_type (optional): 'explore' = read-only research (search/read tools only, returns \
+         findings); 'review' = read-only code review (returns issues with file:line + severity); \
+         'general' (default) = full tools to actually make changes. Pick a read-only type when the \
+         sub-task should not modify anything.\n\
+         The sub-agent runs autonomously to completion under the same workspace confinement, and \
+         cannot itself spawn further sub-agents. Prefer doing small tasks yourself; reach for Task \
+         when delegating genuinely saves context or parallelizes work."
     }
 
     fn parameters(&self) -> Value {
@@ -36,7 +40,12 @@ impl Tool for SubAgentTool {
             "type": "object",
             "properties": {
                 "description": { "type": "string", "description": "Short label for the sub-task." },
-                "prompt": { "type": "string", "description": "Full self-contained instructions for the sub-agent." }
+                "prompt": { "type": "string", "description": "Full self-contained instructions for the sub-agent." },
+                "subagent_type": {
+                    "type": "string",
+                    "enum": ["general", "explore", "review"],
+                    "description": "Sub-agent type: explore/review are read-only; general (default) has full tools."
+                }
             },
             "required": ["description", "prompt"],
             "additionalProperties": false
@@ -54,8 +63,13 @@ impl Tool for SubAgentTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("prompt is required".into()))?
             .to_string();
+        let agent_type = args
+            .get("subagent_type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
-        let result = ctx.spawn_sub_agent(SubAgentRequest { description, prompt }).await?;
+        let result =
+            ctx.spawn_sub_agent(SubAgentRequest { description, prompt, agent_type }).await?;
         Ok(ToolOutput::ok(result))
     }
 }

@@ -190,6 +190,13 @@ impl AgentLoop {
             let fs = fs.clone();
             let cwd = cwd.clone();
             Box::pin(async move {
+                // 子类型限权: explore/review = 只读子集 (无 write/exec); general/None = 全权。
+                let tools = match req.agent_type.as_deref() {
+                    Some("explore") | Some("review") => {
+                        tools.subset(&["Read", "Grep", "Glob", "AstGrep", "Lsp"])
+                    }
+                    _ => tools,
+                };
                 let mut nested = AgentLoop::new(client, tools)
                     .with_approver(approver)
                     .with_fs_scope(fs)
@@ -198,7 +205,8 @@ impl AgentLoop {
                 // 共享父的 LSP 常驻服务器与文件缓存 (高效); sub_agents_enabled 保持 new() 默认 false。
                 nested.files = files;
                 nested.lsp = lsp;
-                let mut session = Session::with_system(crate::prompt::sub_agent_prompt(&cwd));
+                let sys = crate::prompt::sub_agent_prompt(&cwd, req.agent_type.as_deref());
+                let mut session = Session::with_system(sys);
                 session.push_user(format!("{}\n\n{}", req.description, req.prompt));
                 nested.run_turn(&mut session).await.map_err(|e| e.to_string())?;
                 Ok(last_assistant_text(&session))

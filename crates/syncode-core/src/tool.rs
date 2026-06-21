@@ -33,13 +33,15 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
-/// 派生子 agent 的请求 (§5 sub-agent 编排): 一句任务描述 + 给子 agent 的 prompt。
+/// 派生子 agent 的请求 (§5 sub-agent 编排): 一句任务描述 + 给子 agent 的 prompt + 可选子类型。
 #[derive(Debug, Clone)]
 pub struct SubAgentRequest {
     /// 短描述 (展示 / 日志用)。
     pub description: String,
     /// 给子 agent 的实际任务 prompt。
     pub prompt: String,
+    /// 子 agent 类型 (`None`/"general" = 全权; "explore"/"review" = 只读子集 + 定制 prompt)。
+    pub agent_type: Option<String>,
 }
 
 /// 子 agent 派生器 (由 [`AgentLoop`](crate::agent::AgentLoop) 注入): 跑一个**嵌套 agent loop** 到收尾,
