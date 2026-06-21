@@ -117,8 +117,14 @@ struct AgentApp {
     cancel_tx: smol::channel::Sender<()>,
     /// 当前 workspace (agent 操作的项目根); 顶栏展示、可经 Open folder 切换。
     workspace: PathBuf,
-    /// 本会话累计 token 用量 (输入框上方展示)。
+    /// 本会话累计 token 用量 (输入框上方展示, 已采纳的精确值)。
     usage: UsageTotals,
+    /// 流式: 当前正在追加的 assistant / reasoning 行下标 (delta 到了就 append 到它; 非 delta 事件清空)。
+    cur_assistant: Option<usize>,
+    cur_reasoning: Option<usize>,
+    /// 流式: 本轮尚未被 Usage 精确值校准的「在途」字符数 (÷4 估成 token, 让 out/think 边生成边涨)。
+    live_out_chars: usize,
+    live_think_chars: usize,
     /// 在途审批请求 (Some 时渲染审批卡片, 阻塞 agent 直到人点 Allow/Deny)。
     pending_approval: Option<ApprovalRequest>,
     running: bool,
@@ -206,6 +212,10 @@ impl AgentApp {
             // 初始 workspace = 进程 cwd, 与 worker 启动时取的根一致。
             workspace: std::env::current_dir().unwrap_or_default(),
             usage: UsageTotals::default(),
+            cur_assistant: None,
+            cur_reasoning: None,
+            live_out_chars: 0,
+            live_think_chars: 0,
             pending_approval: None,
             running: false,
             _drain: drain,
@@ -254,7 +264,28 @@ impl AgentApp {
     }
 
     fn apply(&mut self, event: AgentEvent) {
+        // 非 delta 事件 = 当前这段流式文本/推理收口 → 折叠刚流完的 reasoning, 下个 delta 起新行。
+        if !matches!(event, AgentEvent::AssistantDelta(_) | AgentEvent::ReasoningDelta(_)) {
+            if let Some(i) = self.cur_reasoning {
+                if let Some(Line::Reasoning { expanded, .. }) = self.lines.get_mut(i) {
+                    *expanded = false; // 看完它「想」就收起来
+                    self.list_state.remeasure_items(i..i + 1);
+                }
+            }
+            self.cur_assistant = None;
+            self.cur_reasoning = None;
+        }
         match event {
+            AgentEvent::AssistantDelta(t) => {
+                self.live_out_chars += t.chars().count();
+                self.append_stream(false, t);
+            }
+            AgentEvent::ReasoningDelta(t) => {
+                // reasoning 也计入 completion(out), 同时单独计 think。
+                self.live_out_chars += t.chars().count();
+                self.live_think_chars += t.chars().count();
+                self.append_stream(true, t);
+            }
             AgentEvent::AssistantText(t) => self.push_line(Line::Assistant(t)),
             AgentEvent::Reasoning { text } => {
                 self.push_line(Line::Reasoning { text, expanded: false })
@@ -286,23 +317,64 @@ impl AgentApp {
                 cache_hit_tokens,
                 reasoning_tokens,
             } => {
-                // 累加到会话总量 (不进 transcript, 只更新输入框上方的用量条)。
+                // 精确值到 → 累加会话总量, 并清掉本轮在途估算 (out/think 从「估算」咬合成精确)。
                 self.usage.prompt += prompt_tokens;
                 self.usage.completion += completion_tokens;
                 self.usage.total += total_tokens;
                 self.usage.cache_hit += cache_hit_tokens;
                 self.usage.reasoning += reasoning_tokens;
+                self.live_out_chars = 0;
+                self.live_think_chars = 0;
             }
             AgentEvent::TurnDone => {
                 self.push_line(Line::Status("— done —".into()));
                 self.running = false;
+                self.live_out_chars = 0;
+                self.live_think_chars = 0;
             }
             AgentEvent::Interrupted => {
                 // 被 Stop 中止: 会话已被 worker 修复成可继续状态。清掉可能在途的审批卡。
                 self.pending_approval = None;
                 self.push_line(Line::Status("⏹ stopped — you can keep chatting".into()));
                 self.running = false;
+                self.live_out_chars = 0;
+                self.live_think_chars = 0;
             }
+        }
+    }
+
+    /// 流式追加一个增量: `reasoning` 决定接到当前 reasoning 行还是 assistant 行; 无当前行则新建。
+    fn append_stream(&mut self, reasoning: bool, delta: String) {
+        let cur = if reasoning { self.cur_reasoning } else { self.cur_assistant };
+        if let Some(i) = cur {
+            let appended = match self.lines.get_mut(i) {
+                Some(Line::Assistant(s)) if !reasoning => {
+                    s.push_str(&delta);
+                    true
+                }
+                Some(Line::Reasoning { text, .. }) if reasoning => {
+                    text.push_str(&delta);
+                    true
+                }
+                _ => false,
+            };
+            if appended {
+                self.list_state.remeasure_items(i..i + 1);
+                return;
+            }
+        }
+        // 无当前行 (或异常丢失) → 新建一行并记下下标。reasoning 流式时展开看它长。
+        let i = self.lines.len();
+        let line = if reasoning {
+            Line::Reasoning { text: delta, expanded: true }
+        } else {
+            Line::Assistant(delta)
+        };
+        self.push_line(line);
+        if reasoning {
+            self.cur_reasoning = Some(i);
+        } else {
+            self.cur_assistant = Some(i);
         }
     }
 
@@ -920,6 +992,12 @@ impl AgentApp {
     fn render_usage(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let u = &self.usage;
+        // 在途估算 (流式中尚未被精确 usage 校准的字符 ÷4)。让 out/think/total 边生成边涨。
+        let live_out = (self.live_out_chars / 4) as u64;
+        let live_think = (self.live_think_chars / 4) as u64;
+        let out = u.completion + live_out;
+        let think = u.reasoning + live_think;
+        let total = u.total + live_out;
         h_flex()
             .justify_between()
             .items_center()
@@ -930,14 +1008,14 @@ impl AgentApp {
                 h_flex()
                     .gap_2()
                     .child(usage_pill("↑", &fmt_tokens(u.prompt), "in", color::teal(), theme))
-                    .child(usage_pill("↓", &fmt_tokens(u.completion), "out", color::blue(), theme)),
+                    .child(usage_pill("↓", &fmt_tokens(out), "out", color::blue(), theme)),
             )
             .child(
                 h_flex()
                     .gap_2()
                     .child(usage_pill("⚡", &fmt_tokens(u.cache_hit), "cached", theme.muted_foreground, theme))
-                    .child(usage_pill("⊙", &fmt_tokens(u.reasoning), "think", color::amber(), theme))
-                    .child(usage_pill("Σ", &fmt_tokens(u.total), "total", theme.foreground, theme)),
+                    .child(usage_pill("⊙", &fmt_tokens(think), "think", color::amber(), theme))
+                    .child(usage_pill("Σ", &fmt_tokens(total), "total", theme.foreground, theme)),
             )
     }
 

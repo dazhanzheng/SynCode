@@ -23,6 +23,7 @@ use std::sync::Arc;
 use syncode_lsp::LspManager;
 use syncode_llm::client::{DeepSeekClient, MODEL};
 use syncode_llm::context::normalize_for_api;
+use syncode_llm::stream::ChatStreamChunk;
 use syncode_llm::wire::{
     ChatRequest, FinishReason, FunctionCall, Message, ReasoningEffort, Thinking, ThinkingType,
     ToolCall,
@@ -32,8 +33,12 @@ use syncode_llm::wire::{
 /// UI 用 [`with_event_sink`](AgentLoop::with_event_sink) 注入一个闭包, 把事件推进自己的通道。
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    /// 模型本轮可见文本 (assistant content)。
+    /// 模型本轮可见文本 (assistant content) —— **非流式整段** (worker 用它发错误/提示)。
     AssistantText(String),
+    /// 流式: assistant 文本的一个增量片段 (逐字追加到当前行)。
+    AssistantDelta(String),
+    /// 流式: reasoning (CoT) 的一个增量片段。
+    ReasoningDelta(String),
     /// 模型本轮的推理 (CoT) 全文; UI 自行折叠/截断展示。
     Reasoning { text: String },
     /// 一个工具即将执行。
@@ -239,7 +244,28 @@ impl AgentLoop {
         self.sync_and_checkpoint(session);
         loop {
             let request = self.build_request(session);
-            let response = self.client.chat(&request).await?;
+            // 流式: 逐 chunk 把 assistant 文本 / reasoning 增量发给 UI (实时逐字 + token 边生成边涨)。
+            // sink 是 self.events 的克隆 (独立 Arc, 不借 self), 故与 self.client 的方法借用不冲突。
+            let sink = self.events.clone();
+            let response = self
+                .client
+                .chat_streaming(&request, |chunk: &ChatStreamChunk| {
+                    if let Some(s) = &sink {
+                        for sc in &chunk.choices {
+                            if let Some(c) = &sc.delta.content {
+                                if !c.is_empty() {
+                                    s(AgentEvent::AssistantDelta(c.clone()));
+                                }
+                            }
+                            if let Some(r) = &sc.delta.reasoning_content {
+                                if !r.is_empty() {
+                                    s(AgentEvent::ReasoningDelta(r.clone()));
+                                }
+                            }
+                        }
+                    }
+                })
+                .await?;
             let usage = response.usage.clone();
             let choice = response
                 .choices
@@ -272,14 +298,8 @@ impl AgentLoop {
             // assistant 全文 (含完整 reasoning_content) 回填 canonical。裁切只在发送投影侧做 (D1)。
             let tool_calls = message.tool_calls.clone().unwrap_or_default();
             let content = message.content.clone().unwrap_or_default();
-            let reasoning_text = message.reasoning_content.clone().unwrap_or_default();
             self.commit(session, message);
-            if !reasoning_text.trim().is_empty() {
-                self.emit(AgentEvent::Reasoning { text: reasoning_text });
-            }
-            if !content.trim().is_empty() {
-                self.emit(AgentEvent::AssistantText(content.clone()));
-            }
+            // reasoning / 文本已在流式回调里逐字发出 (AssistantDelta/ReasoningDelta), 不再整段重发。
 
             if finish == Some(FinishReason::ToolCalls) && !tool_calls.is_empty() {
                 // 并行工具调用: 一轮可有多个 tool_calls, 逐个执行并回填结果 (§11)。

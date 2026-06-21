@@ -118,13 +118,31 @@ impl DeepSeekClient {
     ///
     /// [`chat`]: DeepSeekClient::chat
     pub async fn chat_stream(&self, request: &ChatRequest) -> Result<ChatResponse> {
-        match self.stream_inner(request).await {
+        match self.stream_inner(request, |_| {}).await {
             Ok(resp) => Ok(resp),
             Err(_) => self.chat(request).await, // streaming→非流式 fallback
         }
     }
 
-    async fn stream_inner(&self, request: &ChatRequest) -> Result<ChatResponse> {
+    /// 流式 + **逐 chunk 回调** (供 UI 逐字渲染 / token 实时计数): 每收到一个 SSE chunk 调一次
+    /// `on_chunk`, 最终仍重组成与非流式等价的 [`ChatResponse`]。流式失败 → 回落非流式 [`chat`]
+    /// (此时不再有 delta 回调, 但仍拿到完整结果)。
+    pub async fn chat_streaming<F: FnMut(&ChatStreamChunk)>(
+        &self,
+        request: &ChatRequest,
+        on_chunk: F,
+    ) -> Result<ChatResponse> {
+        match self.stream_inner(request, on_chunk).await {
+            Ok(resp) => Ok(resp),
+            Err(_) => self.chat(request).await,
+        }
+    }
+
+    async fn stream_inner<F: FnMut(&ChatStreamChunk)>(
+        &self,
+        request: &ChatRequest,
+        mut on_chunk: F,
+    ) -> Result<ChatResponse> {
         use futures_util::StreamExt;
         let mut req = request.clone();
         req.stream = true;
@@ -178,6 +196,7 @@ impl DeepSeekClient {
                 }
                 match serde_json::from_str::<ChatStreamChunk>(payload) {
                     Ok(c) => {
+                        on_chunk(&c); // 先回调 (逐字流式), 再并入累积器
                         acc.push(c);
                         got_event = true;
                     }
