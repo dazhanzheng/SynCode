@@ -581,6 +581,7 @@ impl AgentApp {
                 h_flex()
                     .id((kind, i))
                     .flex_1()
+                    .min_w(px(0.)) // flex 子默认 min-width:auto → 不肯收缩到比内容窄; 置 0 摘要才能收缩
                     .gap_2()
                     .items_center()
                     .px_2()
@@ -606,7 +607,17 @@ impl AgentApp {
                             .text_color(tag_color)
                             .child(tag.to_string()),
                     )
-                    .child(div().flex_1().text_sm().text_color(summary_color).child(summary)),
+                    // 摘要单行省略号 (truncate = overflow_hidden+nowrap+ellipsis) + 可收缩 (min_w 0):
+                    // 否则长摘要撑爆整行、顶到滚动条, 文字还在右缘被硬切 (mid-letter)。
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_sm()
+                            .text_color(summary_color)
+                            .child(summary),
+                    ),
             )
             .child(copy_button(("copy-block", i), copy_text, cx))
     }
