@@ -111,6 +111,8 @@ struct AgentApp {
     lines: Vec<Line>,
     input: Entity<InputState>,
     task_tx: smol::channel::Sender<WorkerMsg>,
+    /// Stop 信号通道 (按 Stop 时 send 一个 () → worker 中止当前 turn)。
+    cancel_tx: smol::channel::Sender<()>,
     /// 当前 workspace (agent 操作的项目根); 顶栏展示、可经 Open folder 切换。
     workspace: PathBuf,
     /// 本会话累计 token 用量 (输入框上方展示)。
@@ -128,6 +130,7 @@ struct AgentApp {
 impl AgentApp {
     fn new(
         task_tx: smol::channel::Sender<WorkerMsg>,
+        cancel_tx: smol::channel::Sender<()>,
         event_rx: smol::channel::Receiver<AgentEvent>,
         appr_rx: smol::channel::Receiver<ApprovalRequest>,
         window: &mut Window,
@@ -177,6 +180,7 @@ impl AgentApp {
             lines,
             input,
             task_tx,
+            cancel_tx,
             // 初始 workspace = 进程 cwd, 与 worker 启动时取的根一致。
             workspace: std::env::current_dir().unwrap_or_default(),
             usage: UsageTotals::default(),
@@ -270,6 +274,12 @@ impl AgentApp {
                 self.push_line(Line::Status("— done —".into()));
                 self.running = false;
             }
+            AgentEvent::Interrupted => {
+                // 被 Stop 中止: 会话已被 worker 修复成可继续状态。清掉可能在途的审批卡。
+                self.pending_approval = None;
+                self.push_line(Line::Status("⏹ stopped — you can keep chatting".into()));
+                self.running = false;
+            }
         }
     }
 
@@ -311,6 +321,12 @@ impl AgentApp {
         let _ = self.task_tx.try_send(WorkerMsg::Task(task));
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
+    }
+
+    /// 按 Stop: 通知 worker 中止当前 turn。worker 会修复会话 (使其合法、可继续) 并发回 Interrupted 事件,
+    /// 由 [`apply`](Self::apply) 翻转 running + 落一条「stopped」行。
+    fn stop(&mut self, _cx: &mut Context<Self>) {
+        let _ = self.cancel_tx.try_send(());
     }
 
     /// 开新会话: 通知 worker 丢弃常驻 session, 清空本地 transcript。只在 idle 时可点 (render 已 disable),
@@ -925,13 +941,18 @@ impl AgentApp {
                             .py_2()
                             .child(TextInput::new(&self.input).appearance(false)),
                     )
-                    .child(
+                    .child(if running {
+                        // 跑动时变成 Stop: 按下中止当前 turn (worker 修复会话后可继续)。
+                        Button::new("stop")
+                            .danger()
+                            .label("Stop ■")
+                            .on_click(cx.listener(|this, _ev, _window, cx| this.stop(cx)))
+                    } else {
                         Button::new("send")
                             .primary()
-                            .label(if running { "…" } else { "Send ↗" })
-                            .disabled(running)
-                            .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx))),
-                    ),
+                            .label("Send ↗")
+                            .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx)))
+                    }),
             )
     }
 }
@@ -1059,6 +1080,7 @@ fn run_agent_worker(
     task_rx: smol::channel::Receiver<WorkerMsg>,
     event_tx: smol::channel::Sender<AgentEvent>,
     appr_tx: smol::channel::Sender<ApprovalRequest>,
+    cancel_rx: smol::channel::Receiver<()>,
 ) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -1138,10 +1160,25 @@ fn run_agent_worker(
                 }
                 WorkerMsg::Task(task) => {
                     session.push_user(&task);
-                    if let Err(e) = agent.run_turn(&mut session).await {
-                        let _ = event_tx
-                            .try_send(AgentEvent::AssistantText(format!("⚠ turn error: {e}")));
-                        let _ = event_tx.try_send(AgentEvent::TurnDone);
+                    // 清掉本轮开始前残留的 cancel 信号 (上一次 Stop 的余波别误杀新 turn)。
+                    while cancel_rx.try_recv().is_ok() {}
+                    // run_turn 跑这一轮; 同时盯着 cancel —— Stop 触发 → 丢弃 run_turn future
+                    // (在途 HTTP 请求随之中止)。cancel 分支体不碰 agent/session, 借用在 select! 结束即释放。
+                    let cancelled = tokio::select! {
+                        r = agent.run_turn(&mut session) => {
+                            if let Err(e) = r {
+                                let _ = event_tx
+                                    .try_send(AgentEvent::AssistantText(format!("⚠ turn error: {e}")));
+                                let _ = event_tx.try_send(AgentEvent::TurnDone);
+                            }
+                            false
+                        }
+                        _ = cancel_rx.recv() => true,
+                    };
+                    if cancelled {
+                        // 修复半截 turn 使会话合法、可继续 (悬空 tool_call 补「中断」结果 + 中断标记)。
+                        session.repair_after_interrupt();
+                        let _ = event_tx.try_send(AgentEvent::Interrupted);
                     }
                 }
             }
@@ -1156,9 +1193,11 @@ fn main() {
         let (task_tx, task_rx) = smol::channel::unbounded::<WorkerMsg>();
         let (event_tx, event_rx) = smol::channel::unbounded::<AgentEvent>();
         let (appr_tx, appr_rx) = smol::channel::unbounded::<ApprovalRequest>();
+        // Stop 信号 (UI → worker): 与 task 分开, 因为 worker 跑 turn 时阻塞在 run_turn、不在 recv task。
+        let (cancel_tx, cancel_rx) = smol::channel::unbounded::<()>();
 
         // agent worker 独立线程 (自带 tokio runtime)。
-        thread::spawn(move || run_agent_worker(task_rx, event_tx, appr_tx));
+        thread::spawn(move || run_agent_worker(task_rx, event_tx, appr_tx, cancel_rx));
 
         cx.spawn(async move |cx| {
             let bounds = Bounds {
@@ -1174,7 +1213,8 @@ fn main() {
                 ..Default::default()
             };
             cx.open_window(options, |window, cx| {
-                let view = cx.new(|cx| AgentApp::new(task_tx, event_rx, appr_rx, window, cx));
+                let view =
+                    cx.new(|cx| AgentApp::new(task_tx, cancel_tx, event_rx, appr_rx, window, cx));
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .expect("failed to open window");

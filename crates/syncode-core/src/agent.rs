@@ -53,6 +53,8 @@ pub enum AgentEvent {
     },
     /// turn 正常结束。
     TurnDone,
+    /// turn 被用户中止 (Stop)。会话已被 `repair_after_interrupt` 修复成可继续状态。
+    Interrupted,
 }
 
 /// 事件回调汇 (在 agent 的 async 上下文里**同步**调用; 实现应是非阻塞的, 如往 channel 投递)。
