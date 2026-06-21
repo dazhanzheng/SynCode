@@ -61,9 +61,9 @@ impl Tool for BashTool {
          - Optional timeout_ms (default 120000, max 600000); on timeout the command is killed and \
          the output produced so far is returned. On Windows the whole process tree is killed; on \
          Unix only the direct child is (for now).\n\
-         - Prefer the dedicated tools over shell equivalents: Read/Write/Edit for files, Grep/AstGrep \
-         for search, Lsp for code intelligence. Use Bash for builds, tests, git, package managers, \
-         and other commands. Quote paths that contain spaces.\n\
+         - Prefer the dedicated tools over shell equivalents: Read/Write/Edit for files, Glob to list \
+         files or explore the tree, Grep/AstGrep for search, Lsp for code intelligence. Use Bash for \
+         builds, tests, git, package managers, and other commands. Quote paths that contain spaces.\n\
          - Optional `shell` selects the interpreter: 'auto' (default; cmd.exe on Windows, sh on Unix), \
          'cmd', 'powershell'/'pwsh' (Windows PowerShell — different quoting and cmdlets), 'sh', 'bash'.\n\
          - Optional `max_memory_mb` caps the command's memory (Windows job memory / Unix RLIMIT_AS); \

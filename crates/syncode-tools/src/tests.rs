@@ -1,8 +1,8 @@
 //! 文件工具集成测试: 验证 Read/Write/Edit/Grep 的契约 + 共享缓存联动 (必先读 / stale / 原子写)。
 
 use crate::{
-    AstEditTool, AstGrepTool, BashOutputTool, BashTool, EditTool, GrepTool, LspTool, ReadTool,
-    WriteTool,
+    AstEditTool, AstGrepTool, BashOutputTool, BashTool, EditTool, GlobTool, GrepTool, LspTool,
+    ReadTool, WriteTool,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -499,6 +499,36 @@ async fn bash_scrubs_parent_env_keeps_essentials() {
         .await
         .unwrap();
     assert!(!out2.content.contains("%PATH%"), "PATH should be allowlisted: {}", out2.content);
+}
+
+#[tokio::test]
+async fn glob_lists_files_respecting_gitignore_and_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join(".gitignore"), "ignored.txt\ntarget/\n").unwrap();
+    std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+    std::fs::write(root.join("notes.txt"), "x\n").unwrap();
+    std::fs::write(root.join("ignored.txt"), "secret\n").unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src").join("c.rs"), "fn c() {}\n").unwrap();
+    std::fs::create_dir_all(root.join("target")).unwrap();
+    std::fs::write(root.join("target").join("junk.rs"), "fn junk() {}\n").unwrap();
+
+    let ctx = ToolCtx::new(Arc::new(FileStateCache::new()), root.to_path_buf());
+
+    // pattern *.rs → 任意深度的 .rs 命中 (含 src/c.rs); 跳过 gitignore 的 target/; 非 .rs 不列。
+    let out = GlobTool.call(json!({ "pattern": "*.rs" }), &ctx).await.unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("a.rs"), "{}", out.content);
+    assert!(out.content.contains("c.rs"), "src/c.rs should match recursively: {}", out.content);
+    assert!(!out.content.contains("notes.txt"), "non-.rs excluded: {}", out.content);
+    assert!(!out.content.contains("junk.rs"), "gitignored target/ excluded: {}", out.content);
+
+    // 无 pattern → 列全部非忽略文件; ignored.txt 被 .gitignore 排除。
+    let all = GlobTool.call(json!({}), &ctx).await.unwrap();
+    assert!(all.content.contains("notes.txt"), "{}", all.content);
+    assert!(!all.content.contains("ignored.txt"), "gitignored file excluded: {}", all.content);
 }
 
 #[tokio::test]

@@ -50,9 +50,10 @@ async fn main() {
 
     let mut session = Session::with_system(
         "You are SynCode, an autonomous coding agent operating inside a Rust workspace. You have file \
-         tools (Read/Write/Edit), structural search/rewrite (Grep/AstGrep/AstEdit), code intelligence \
-         (Lsp), and a Bash tool. Use absolute paths. Locate code with Grep/AstGrep/Lsp before editing. \
-         After editing, compile with cargo via Bash and fix any errors. Be concise.",
+         tools (Glob to list files, Read/Write/Edit), structural search/rewrite (Grep/AstGrep/AstEdit), \
+         code intelligence (Lsp), and a Bash tool. Use absolute paths. Prefer Glob over `ls`/`find` \
+         to list files. Locate code with Grep/AstGrep/Lsp before editing. After editing, compile with \
+         cargo via Bash and fix any errors. Be concise.",
     );
     session.push_user(&task);
 
