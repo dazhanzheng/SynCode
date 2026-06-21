@@ -49,10 +49,13 @@ impl Tool for BashTool {
     fn description(&self) -> &str {
         "Execute a shell command and return its stdout, stderr, and exit code.\n\
          Usage:\n\
-         - Runs from the current working directory in a shell: cmd.exe (/C) on Windows, sh -c on \
-         Unix. On Windows use cmd.exe syntax, not POSIX sh.\n\
+         - Runs from the current working directory in a fresh shell: PowerShell on Windows (pwsh if \
+         installed, else Windows PowerShell), sh -c on Unix.\n\
+         - On Windows write PowerShell, NOT POSIX: use Get-ChildItem / Select-Object / -Recurse / \
+         Where-Object, not `ls -la`, `head`, `grep`, or `cmd /c` (those POSIX tools are unavailable \
+         unless you pass shell:'bash'). Chain steps with `;`; `&&`/`||` need pwsh (PowerShell 7).\n\
          - The working directory and shell state do NOT persist between calls (each call is a fresh \
-         shell); use absolute paths, or chain steps in one command with && / ;.\n\
+         shell); use absolute paths, or chain steps in one command (`;`, and `&&` on Unix/pwsh).\n\
          - stdout and stderr are returned as separate blocks (not chronologically interleaved); each \
          is truncated to ~30000 bytes.\n\
          - Optional timeout_ms (default 120000, max 600000); on timeout the command is killed and \
@@ -77,7 +80,7 @@ impl Tool for BashTool {
             "properties": {
                 "command": { "type": "string", "description": "The shell command to execute." },
                 "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 120000, max 600000)." },
-                "shell": { "type": "string", "enum": ["auto", "cmd", "powershell", "pwsh", "sh", "bash"], "description": "Interpreter to run the command in. Default 'auto' = cmd.exe on Windows, sh on Unix." },
+                "shell": { "type": "string", "enum": ["auto", "cmd", "powershell", "pwsh", "sh", "bash"], "description": "Interpreter to run the command in. Default 'auto' = PowerShell on Windows (pwsh if installed, else Windows PowerShell), sh on Unix. Pass 'bash' for POSIX syntax (ls/head/grep) if bash is installed, or 'cmd' for cmd.exe." },
                 "max_memory_mb": { "type": "integer", "description": "Optional memory cap in MiB (Windows job memory / Unix RLIMIT_AS). Default: unlimited." },
                 "max_processes": { "type": "integer", "description": "Optional cap on live processes (Windows job). Default 1024." },
                 "run_in_background": { "type": "boolean", "description": "Run detached and return a task id immediately; poll/kill it with the BashOutput tool. For long-running commands." }
@@ -248,11 +251,7 @@ impl Tool for BashTool {
 /// 选 shell 并构造命令。`shell` = auto/cmd/powershell/pwsh/sh/bash; auto = Windows `cmd /C` / 其他 `sh -c`。
 /// PowerShell 走 `-NoProfile -NonInteractive -Command` (不加载用户 profile、不交互、防挂)。
 fn shell_command(command: &str, shell: &str) -> Result<Command, ToolError> {
-    let kind = if shell == "auto" {
-        if cfg!(windows) { "cmd" } else { "sh" }
-    } else {
-        shell
-    };
+    let kind = if shell == "auto" { default_shell() } else { shell };
     let cmd = match kind {
         "cmd" => {
             let mut c = Command::new("cmd");
@@ -286,6 +285,31 @@ fn shell_command(command: &str, shell: &str) -> Result<Command, ToolError> {
         }
     };
     Ok(cmd)
+}
+
+/// `shell:"auto"` 的平台默认: Unix → `sh`; Windows → PowerShell。
+/// **不再默认 cmd.exe** —— 模型本能写 PowerShell/POSIX, cmd 二者都不沾, 一跑就「not recognized」。
+/// 优先 `pwsh` (PowerShell 7, 支持 `&&`/`||`), 没装则退回内置 `powershell` (5.1, 总是在)。
+#[cfg(windows)]
+fn default_shell() -> &'static str {
+    if pwsh_on_path() {
+        "pwsh"
+    } else {
+        "powershell"
+    }
+}
+
+#[cfg(not(windows))]
+fn default_shell() -> &'static str {
+    "sh"
+}
+
+/// PATH 上是否有 `pwsh.exe` (PowerShell 7)。纯查找、不 spawn。
+#[cfg(windows)]
+fn pwsh_on_path() -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join("pwsh.exe").exists()))
+        .unwrap_or(false)
 }
 
 /// 把一个异步读流**增量**抽进后台任务的输出缓冲 (到 `MAX_BG_OUTPUT` 上限即停止追加)。
@@ -595,10 +619,20 @@ fn classify_program(raw: &str, args: &[&str]) -> (ActionClass, Option<String>) {
         | "df" | "uname" | "ver" | "sleep" | "true" | "false" | "clear" | "cls" | "basename"
         | "dirname" | "realpath" | "readlink" | "sort" | "uniq" | "cut" | "diff" | "cmp"
         | "tr"
-        // PowerShell 读类 cmdlet / 别名。
+        // PowerShell 读类 / 管道转换类 cmdlet 与别名 (纯读 / 纯数据变换, 不写不执行)。
+        // 补全常见管道 cmdlet (Select-Object/Sort-Object/Format-*/…), 否则 `gci | select …`
+        // 这类只读管道里任一段不认识 → ArbitraryExec → 每次弹审批 (用户实测痛点)。
         | "get-childitem" | "gci" | "get-content" | "gc" | "select-string" | "sls"
-        | "test-path" | "get-item" | "gi" | "get-location" | "measure-object"
-        | "write-output" | "write-host" | "get-process" | "where-object" | "foreach-object" => {
+        | "test-path" | "get-item" | "gi" | "get-location" | "gl" | "measure-object" | "measure"
+        | "write-output" | "write-host" | "get-process" | "where-object" | "foreach-object"
+        | "select-object" | "select" | "sort-object" | "format-table" | "ft" | "format-list"
+        | "fl" | "format-wide" | "fw" | "out-string" | "out-host" | "group-object" | "group"
+        | "get-member" | "gm" | "get-command" | "gcm" | "resolve-path" | "rvpa" | "split-path"
+        | "join-path" | "get-itemproperty" | "gp" | "convertto-json" | "convertfrom-json"
+        | "convertto-csv" | "convertfrom-csv" | "compare-object" | "compare" | "get-date"
+        | "get-alias" | "get-variable" | "gv" | "get-help" | "get-module" | "get-unique" | "gu"
+        // ForEach-Object / Where-Object 的符号别名 (% / ?) —— 与上面同类 (既有决策)。
+        | "%" | "?" => {
             (ActionClass::ReadFs, None)
         }
         _ => (ActionClass::ArbitraryExec, None),
@@ -887,6 +921,30 @@ mod tests {
         assert_eq!(class_of("Invoke-WebRequest https://x -OutFile y"), ActionClass::Network);
         assert_eq!(class_of("New-Item -ItemType File foo.txt"), ActionClass::WriteFs);
         assert_eq!(class_of("Stop-Computer"), ActionClass::Privileged);
+    }
+
+    #[test]
+    fn powershell_readonly_pipelines_are_allowed_not_asked() {
+        // 用户痛点: 只读 PowerShell 管道里有 Select-Object/Sort-Object 等就被判 Ask。修后应全 Allow。
+        let approver = PolicyApprover::new("/proj");
+        for cmd in [
+            "Get-ChildItem -Recurse | Select-Object FullName",
+            "Get-ChildItem -Recurse -File | Sort-Object Length | Select-Object -First 50",
+            "Get-ChildItem | Where-Object { $_.Name -like '*.rs' } | Measure-Object",
+            "Get-Content Cargo.toml | Select-String version",
+            "gci -Recurse | % { $_.FullName }",
+            "Get-ChildItem | Format-Table Name, Length",
+        ] {
+            assert_eq!(class_of(cmd), ActionClass::ReadFs, "{cmd}");
+            assert_eq!(approver.decide(&classify_command(cmd)), Decision::Allow, "{cmd}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_shell_is_powershell_not_cmd() {
+        // 默认不再是 cmd.exe (模型写 PowerShell/POSIX, cmd 二者都跑不了)。
+        assert!(matches!(default_shell(), "pwsh" | "powershell"));
     }
 
     #[test]

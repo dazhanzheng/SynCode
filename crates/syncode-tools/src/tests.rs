@@ -485,15 +485,17 @@ async fn bash_can_compile_and_run_rust_under_scrubbed_env() {
 #[tokio::test]
 async fn bash_scrubs_parent_env_keeps_essentials() {
     let ctx = ctx();
+    // 用 cmd 显式验 env scrub (`%VAR%` 展开语义清晰; scrub 本身与 shell 无关 —— 它在 spawn 前作用于
+    // Command 的 env, 默认 shell 现已改 PowerShell, 故这里钉 shell:"cmd" 保持断言成立)。
     // USERNAME 总在父进程 env, 但不在白名单 → 子进程拿不到 → cmd 不展开, 原样回显 %USERNAME%。
     let out = BashTool
-        .call(json!({ "command": "echo user=[%USERNAME%]" }), &ctx)
+        .call(json!({ "command": "echo user=[%USERNAME%]", "shell": "cmd" }), &ctx)
         .await
         .unwrap();
     assert!(out.content.contains("%USERNAME%"), "env not scrubbed: {}", out.content);
     // PATH 在白名单 → 被回填 → cmd 能展开 (不原样输出 %PATH%)。
     let out2 = BashTool
-        .call(json!({ "command": "echo path=[%PATH%]" }), &ctx)
+        .call(json!({ "command": "echo path=[%PATH%]", "shell": "cmd" }), &ctx)
         .await
         .unwrap();
     assert!(!out2.content.contains("%PATH%"), "PATH should be allowlisted: {}", out2.content);
