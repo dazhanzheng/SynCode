@@ -180,6 +180,13 @@ impl AgentLoop {
         }
     }
 
+    /// 清空持久化的当前会话 (New chat: 删掉该 session_id 的全部事件)。无 store 时 no-op。
+    pub fn reset_store(&self) {
+        if let Some(store) = &self.store {
+            let _ = store.rollback(&self.session_id, -1); // 删 seq > -1 = 全部
+        }
+    }
+
     /// 组装一次请求: 从 canonical 投影出裁切后的 wire messages + 结构 normalize (③),
     /// 思考模式 + max 强度 (复杂 agent 场景, §7.1), 带全部工具定义。
     fn build_request(&self, session: &Session) -> ChatRequest {

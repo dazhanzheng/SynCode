@@ -19,7 +19,9 @@ use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::text::TextView;
 use gpui_component::{button::*, *};
 use syncode_core::permission::{ActionRequest, Decision, PolicyApprover};
+use syncode_core::state::SessionStore;
 use syncode_core::{AgentEvent, AgentLoop, AskGate, EventSink, FsScope, Session, ToolRegistry};
+use syncode_llm::wire::{Message, Role};
 use syncode_llm::{DeepSeekClient, DeepSeekConfig};
 use syncode_tools::register_builtins;
 
@@ -125,6 +127,7 @@ struct AgentApp {
     list_state: ListState,
     _drain: Task<()>,
     _appr_drain: Task<()>,
+    _resume_drain: Task<()>,
 }
 
 impl AgentApp {
@@ -133,6 +136,7 @@ impl AgentApp {
         cancel_tx: smol::channel::Sender<()>,
         event_rx: smol::channel::Receiver<AgentEvent>,
         appr_rx: smol::channel::Receiver<ApprovalRequest>,
+        resume_rx: smol::channel::Receiver<Vec<Message>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -173,6 +177,24 @@ impl AgentApp {
                 }
             }
         });
+        // 抽干 resume 流 (worker 发来存档历史) → 重建 transcript (开机/切 workspace 自动接上次)。
+        let resume_drain = cx.spawn(async move |weak, cx| {
+            while let Ok(msgs) = resume_rx.recv().await {
+                let updated = weak.update(cx, |this, cx| {
+                    let mut lines = lines_from_messages(&msgs);
+                    if lines.is_empty() {
+                        lines.push(Line::Status(
+                            "Ready — edit the task and press Enter (or Send).".into(),
+                        ));
+                    }
+                    this.reset_lines(lines);
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
         let lines = vec![Line::Status("Ready — edit the task and press Enter (or Send).".into())];
         Self {
             // ListState 项数必须与 lines 同步 (初始 1 行)。Bottom 对齐 → 新内容贴底。
@@ -188,6 +210,7 @@ impl AgentApp {
             running: false,
             _drain: drain,
             _appr_drain: appr_drain,
+            _resume_drain: resume_drain,
         }
     }
 
@@ -1074,6 +1097,80 @@ fn short_path(p: &Path) -> String {
     }
 }
 
+/// 用户级数据目录 (放持久化 DB)。Windows `%LOCALAPPDATA%`; 其它 `$XDG_DATA_HOME` / `~/.local/share`。
+fn data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+        })
+    }
+}
+
+/// 会话持久化 DB 路径 `<data_dir>/SynCode/sessions.db` (建好父目录)。取不到目录则 None → 降级纯内存。
+fn session_db_path() -> Option<PathBuf> {
+    let base = data_dir()?.join("SynCode");
+    std::fs::create_dir_all(&base).ok()?;
+    Some(base.join("sessions.db"))
+}
+
+/// resume 时把存档的 canonical messages 重建成 UI transcript 行 (近似还原: diff 卡不持久化, 故不重现)。
+fn lines_from_messages(msgs: &[Message]) -> Vec<Line> {
+    let mut lines = Vec::new();
+    for m in msgs {
+        match m.role {
+            Role::System => {} // 系统提示不显示
+            Role::User => {
+                if let Some(c) = &m.content {
+                    if c == "[Request interrupted by user]" {
+                        lines.push(Line::Status("⏹ (interrupted earlier)".into()));
+                    } else if !c.trim().is_empty() {
+                        lines.push(Line::User(c.clone()));
+                    }
+                }
+            }
+            Role::Assistant => {
+                if let Some(r) = &m.reasoning_content {
+                    if !r.trim().is_empty() {
+                        lines.push(Line::Reasoning { text: r.clone(), expanded: false });
+                    }
+                }
+                if let Some(c) = &m.content {
+                    if !c.trim().is_empty() {
+                        lines.push(Line::Assistant(c.clone()));
+                    }
+                }
+                for tc in m.tool_calls.iter().flatten() {
+                    lines.push(Line::Tool {
+                        name: tc.function.name.clone(),
+                        args: tc.function.arguments.clone(),
+                        result: None,
+                        ok: true,
+                        expanded: false,
+                    });
+                }
+            }
+            Role::Tool => {
+                // 回填最近一个未完成的 Tool 行 (与实时 apply 同逻辑)。
+                if let Some(c) = &m.content {
+                    let is_err = c.starts_with("<tool_use_error>");
+                    if let Some(Line::Tool { result, ok, .. }) =
+                        lines.iter_mut().rev().find(|l| matches!(l, Line::Tool { result: None, .. }))
+                    {
+                        *result = Some(c.clone());
+                        *ok = !is_err;
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
 /// agent worker: 独立线程 + tokio runtime; 持一个**常驻 session** 跨任务累积上下文 (多轮)。
 /// 收到 `Task` 就把它 push 进 session 跑一个 turn; 收到 `Reset` 丢弃 session 开新会话。
 fn run_agent_worker(
@@ -1081,6 +1178,7 @@ fn run_agent_worker(
     event_tx: smol::channel::Sender<AgentEvent>,
     appr_tx: smol::channel::Sender<ApprovalRequest>,
     cancel_rx: smol::channel::Receiver<()>,
+    resume_tx: smol::channel::Sender<Vec<Message>>,
 ) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -1131,32 +1229,55 @@ fn run_agent_worker(
             });
             fut
         });
+        // 会话持久化 DB (按 workspace 一份; session_id = 规范化路径)。取不到目录则降级纯内存。
+        let db_path = session_db_path();
         // 给定根造一个 AgentLoop: cwd / 审批写根 / FsScope 收容根都钉在该根 (单一真相 #14)。
         // 切 workspace 时整体重建 (新根 = 新 PolicyApprover / FsScope / cwd; 工具缓存 / LSP 也重置)。
+        // 挂持久化: 每个 workspace 一份历史 (开机/切换自动 resume)。
         let make_agent = |root: &Path| -> AgentLoop {
             let mut registry = ToolRegistry::new();
             register_builtins(&mut registry);
-            AgentLoop::new(client.clone(), registry)
+            let mut agent = AgentLoop::new(client.clone(), registry)
                 .with_approver(Arc::new(PolicyApprover::new(root)))
                 .with_fs_scope(Some(Arc::new(FsScope::new(root))))
                 .with_cwd(root)
                 .with_event_sink(sink.clone())
-                .with_ask_gate(gate.clone())
+                .with_ask_gate(gate.clone());
+            if let Some(db) = &db_path {
+                if let Ok(store) = SessionStore::open(db) {
+                    agent = agent.with_store(store, root.to_string_lossy().to_string());
+                }
+            }
+            agent
+        };
+
+        // 从 store 取回该 workspace 的历史 (空则新建带 system prompt 的会话); 再把存档行发给 UI 重建界面。
+        let resume = |agent: &AgentLoop, root: &Path| -> Session {
+            let s = agent.resume_session();
+            if s.messages().is_empty() {
+                Session::with_system(system_prompt(root))
+            } else {
+                s
+            }
         };
 
         let mut root = std::env::current_dir().unwrap_or_default();
         let mut agent = make_agent(&root);
         // 常驻 session: 跨任务累积 (多轮)。Reset / 切 workspace 时整体重建。
-        let mut session = Session::with_system(system_prompt(&root));
+        let mut session = resume(&agent, &root);
+        let _ = resume_tx.try_send(session.messages().to_vec());
         while let Ok(msg) = task_rx.recv().await {
             match msg {
                 WorkerMsg::Reset => {
+                    agent.reset_store(); // 清掉该 workspace 的持久化历史
                     session = Session::with_system(system_prompt(&root));
+                    // UI 侧已自行 reset 到 "New chat" 状态, 不必再 send resume。
                 }
                 WorkerMsg::SetWorkspace(path) => {
                     root = path;
-                    agent = make_agent(&root); // 重建: 新根钉进两闸 + cwd
-                    session = Session::with_system(system_prompt(&root));
+                    agent = make_agent(&root); // 重建: 新根钉进两闸 + cwd + 该 workspace 的 store
+                    session = resume(&agent, &root); // 载入新 workspace 的历史
+                    let _ = resume_tx.try_send(session.messages().to_vec()); // 让 UI 重建 transcript
                 }
                 WorkerMsg::Task(task) => {
                     session.push_user(&task);
@@ -1195,9 +1316,11 @@ fn main() {
         let (appr_tx, appr_rx) = smol::channel::unbounded::<ApprovalRequest>();
         // Stop 信号 (UI → worker): 与 task 分开, 因为 worker 跑 turn 时阻塞在 run_turn、不在 recv task。
         let (cancel_tx, cancel_rx) = smol::channel::unbounded::<()>();
+        // resume 通道 (worker → UI): 开机/切 workspace 时把存档历史发给 UI 重建 transcript。
+        let (resume_tx, resume_rx) = smol::channel::unbounded::<Vec<Message>>();
 
         // agent worker 独立线程 (自带 tokio runtime)。
-        thread::spawn(move || run_agent_worker(task_rx, event_tx, appr_tx, cancel_rx));
+        thread::spawn(move || run_agent_worker(task_rx, event_tx, appr_tx, cancel_rx, resume_tx));
 
         cx.spawn(async move |cx| {
             let bounds = Bounds {
@@ -1213,8 +1336,9 @@ fn main() {
                 ..Default::default()
             };
             cx.open_window(options, |window, cx| {
-                let view =
-                    cx.new(|cx| AgentApp::new(task_tx, cancel_tx, event_rx, appr_rx, window, cx));
+                let view = cx.new(|cx| {
+                    AgentApp::new(task_tx, cancel_tx, event_rx, appr_rx, resume_rx, window, cx)
+                });
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .expect("failed to open window");
