@@ -632,22 +632,23 @@ impl Render for AgentApp {
                 .py_5()
                 .gap_4()
                 .child(self.render_header(running, cx))
-                // transcript: relative 容器内 = 滚动区 + 右侧**窄条**滚动条 overlay。
-                // 滚动条 thumb 的大小/位置只取自 ScrollHandle (视口高 + 内容高 = 真实滚动状态), 故对应正确;
-                // overlay 只占右侧 ~16px、不盖内容区, 所以内容区的滚轮不被它的 hitbox 拦 (滚轮可用)。
+                // transcript (照 gpui-component Scrollable 的已验证结构):
+                //   relative+flex_1+**min_h_0** 槽 (给定有界视口高, 否则内容按自然高撑开 → 不溢出 → 滚轮
+                //   没东西可滚) → size_full flex-col 滚动区 (overflow_y_scroll) → 内容包成**单个 flex_1 子**。
+                //   滚动条放右侧 ~16px 窄条 sibling: thumb 只取自 ScrollHandle (视口高+内容高=真实状态) 故对应
+                //   正确; 窄条不盖内容区, 内容区滚轮也不被它 hitbox 拦。三处缺一: 要么滚不动、要么 thumb 错位。
                 .child(
                     div()
                         .relative()
                         .flex_1()
+                        .min_h(px(0.))
                         .child(
                             v_flex()
                                 .id("transcript")
                                 .size_full()
-                                .gap_3()
-                                .pr_4()
                                 .track_scroll(&self.scroll)
                                 .overflow_y_scroll()
-                                .children(rows),
+                                .child(v_flex().flex_1().gap_3().pr_4().children(rows)),
                         )
                         .child(
                             div()
