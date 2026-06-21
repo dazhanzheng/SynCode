@@ -15,7 +15,7 @@ use std::thread;
 
 use gpui::*;
 use gpui_component::input::{Input as TextInput, InputEvent, InputState};
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::text::TextView;
 use gpui_component::{button::*, *};
 use syncode_core::permission::{ActionRequest, Decision, PolicyApprover};
@@ -61,6 +61,16 @@ struct ApprovalRequest {
     reply: smol::channel::Sender<Decision>,
 }
 
+/// 累计 token 用量 (跨本会话所有 API 响应求和; New chat / 切 workspace 时清零)。
+#[derive(Default, Clone, Copy)]
+struct UsageTotals {
+    prompt: u64,
+    completion: u64,
+    total: u64,
+    cache_hit: u64,
+    reasoning: u64,
+}
+
 /// transcript 一行。
 #[derive(Clone)]
 enum Line {
@@ -82,6 +92,8 @@ struct AgentApp {
     task_tx: smol::channel::Sender<WorkerMsg>,
     /// 当前 workspace (agent 操作的项目根); 顶栏展示、可经 Open folder 切换。
     workspace: PathBuf,
+    /// 本会话累计 token 用量 (输入框上方展示)。
+    usage: UsageTotals,
     /// 在途审批请求 (Some 时渲染审批卡片, 阻塞 agent 直到人点 Allow/Deny)。
     pending_approval: Option<ApprovalRequest>,
     running: bool,
@@ -142,6 +154,7 @@ impl AgentApp {
             task_tx,
             // 初始 workspace = 进程 cwd, 与 worker 启动时取的根一致。
             workspace: std::env::current_dir().unwrap_or_default(),
+            usage: UsageTotals::default(),
             pending_approval: None,
             running: false,
             scroll: ScrollHandle::new(),
@@ -185,6 +198,20 @@ impl AgentApp {
                     *slot = Some(result);
                     *ok = !is_error;
                 }
+            }
+            AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cache_hit_tokens,
+                reasoning_tokens,
+            } => {
+                // 累加到会话总量 (不进 transcript, 只更新输入框上方的用量条)。
+                self.usage.prompt += prompt_tokens;
+                self.usage.completion += completion_tokens;
+                self.usage.total += total_tokens;
+                self.usage.cache_hit += cache_hit_tokens;
+                self.usage.reasoning += reasoning_tokens;
             }
             AgentEvent::TurnDone => {
                 self.lines.push(Line::Status("— done —".into()));
@@ -250,6 +277,7 @@ impl AgentApp {
         }
         let _ = self.task_tx.try_send(WorkerMsg::Reset);
         self.lines = vec![Line::Status("New chat — context cleared.".into())];
+        self.usage = UsageTotals::default();
         cx.notify();
     }
 
@@ -280,6 +308,7 @@ impl AgentApp {
         self.lines =
             vec![Line::Status(format!("Workspace → {} · context cleared.", path.display()))];
         self.workspace = path;
+        self.usage = UsageTotals::default();
         cx.notify();
     }
 
@@ -603,23 +632,39 @@ impl Render for AgentApp {
                 .py_5()
                 .gap_4()
                 .child(self.render_header(running, cx))
-                // transcript: 可滚动 + 竖向滚动条。用 gpui-component 的 `vertical_scrollbar` 扩展
-                // (把滚动条正确接进滚动元素), 而非手搓全屏 overlay —— 后者的全屏 hitbox 会吞掉内容区
-                // 的滚轮事件 (导致滚轮滚不动)。滚动条默认随滚动出现、空闲淡出。
+                // transcript: relative 容器内 = 滚动区 + 右侧**窄条**滚动条 overlay。
+                // 滚动条 thumb 的大小/位置只取自 ScrollHandle (视口高 + 内容高 = 真实滚动状态), 故对应正确;
+                // overlay 只占右侧 ~16px、不盖内容区, 所以内容区的滚轮不被它的 hitbox 拦 (滚轮可用)。
                 .child(
-                    v_flex()
-                        .id("transcript")
+                    div()
                         .relative()
                         .flex_1()
-                        .gap_3()
-                        .pr_3()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .children(rows)
-                        .vertical_scrollbar(&self.scroll),
+                        .child(
+                            v_flex()
+                                .id("transcript")
+                                .size_full()
+                                .gap_3()
+                                .pr_4()
+                                .track_scroll(&self.scroll)
+                                .overflow_y_scroll()
+                                .children(rows),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .w(px(16.))
+                                .child(
+                                    Scrollbar::vertical(&self.scroll)
+                                        .scrollbar_show(ScrollbarShow::Always),
+                                ),
+                        ),
                 )
                 // 审批卡片 (仅在有在途 Ask 请求时): 阻塞中, 等人点 Allow once / Deny。
                 .children(self.pending_approval.as_ref().map(|p| self.render_approval(p, cx)))
+                .child(self.render_usage(cx))
                 .child(self.render_input(running, cx)),
         )
     }
@@ -684,6 +729,31 @@ impl AgentApp {
                             .disabled(running)
                             .on_click(cx.listener(|this, _ev, window, cx| this.new_chat(window, cx))),
                     ),
+            )
+    }
+
+    /// 输入框上方的 token 用量条: 左侧 输入/输出, 右侧 缓存命中/思考/总量 (会话累计)。
+    fn render_usage(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let u = &self.usage;
+        h_flex()
+            .justify_between()
+            .items_center()
+            .px_1()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(div().child(format!("↑ {} in", fmt_tokens(u.prompt))))
+                    .child(div().child(format!("↓ {} out", fmt_tokens(u.completion)))),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(div().child(format!("⚡ {} cached", fmt_tokens(u.cache_hit))))
+                    .child(div().child(format!("⊙ {} think", fmt_tokens(u.reasoning))))
+                    .child(div().child(format!("Σ {} total", fmt_tokens(u.total)))),
             )
     }
 
@@ -782,6 +852,17 @@ fn copy_button(id: impl Into<ElementId>, text: String, cx: &Context<AgentApp>) -
         .on_click(cx.listener(move |_this, _ev, _window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
         }))
+}
+
+/// token 数人读化: <1k 原样, <1M → x.xk, 否则 x.xxM。
+fn fmt_tokens(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{:.2}M", n as f64 / 1_000_000.0)
+    }
 }
 
 /// 路径短展示: 太长时保留**尾部** (更有信息量), 前面用 `…` 省略。

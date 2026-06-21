@@ -42,6 +42,15 @@ pub enum AgentEvent {
     ToolFinished { name: String, result: String, is_error: bool },
     /// 编辑类工具改了文件: 携带 unified diff (供 UI 渲染 diff 视图)。
     FileChanged { path: String, diff: String },
+    /// 一次 API 响应的 token 用量 (DeepSeek usage)。一个 turn 可能多次 (每轮工具往返各一次);
+    /// `cache_hit_tokens` = prompt 命中前缀缓存的部分, `reasoning_tokens` = CoT 消耗 (含在 completion 内)。
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        cache_hit_tokens: u64,
+        reasoning_tokens: u64,
+    },
     /// turn 正常结束。
     TurnDone,
 }
@@ -222,6 +231,7 @@ impl AgentLoop {
         loop {
             let request = self.build_request(session);
             let response = self.client.chat(&request).await?;
+            let usage = response.usage.clone();
             let choice = response
                 .choices
                 .into_iter()
@@ -233,6 +243,21 @@ impl AgentLoop {
             // 后端算力不足被中断 (§16): 不采纳本次输出, 重发。(TODO: 加重试上限。)
             if finish == Some(FinishReason::InsufficientSystemResource) {
                 continue;
+            }
+
+            // 采纳了本次输出 → 报 token 用量 (UI 累计展示)。
+            if let Some(u) = &usage {
+                self.emit(AgentEvent::Usage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    total_tokens: u.total_tokens,
+                    cache_hit_tokens: u.prompt_cache_hit_tokens,
+                    reasoning_tokens: u
+                        .completion_tokens_details
+                        .as_ref()
+                        .map(|d| d.reasoning_tokens)
+                        .unwrap_or(0),
+                });
             }
 
             // assistant 全文 (含完整 reasoning_content) 回填 canonical。裁切只在发送投影侧做 (D1)。
