@@ -95,6 +95,37 @@ items as owner/repo#123. No emojis unless asked.",
     )
 }
 
+/// 摘要器 system prompt (压缩顶档用, §1 阶段 4): 把一段旧对话前缀压成**结构化交接摘要**,
+/// 让 agent 能在丢掉逐字历史后无缝续作。契约借鉴 Claude Code 的 compact 模板 (9 段), 用 Rust 重写。
+/// 摘要器以**非流式、thinking 关**的一次性请求跑; 结果作为单条 user 消息注入投影 (无 reasoning_content,
+/// 天然规避 §7.4/§7.5 的 400)。
+pub fn summarizer_prompt() -> &'static str {
+    "You are compacting an AI coding agent's conversation so it can continue seamlessly after the \
+verbatim history is dropped. You will be given the earlier part of a session (user requests, the \
+agent's actions, tool calls and their results). Produce a dense, faithful handoff summary — not a \
+high-level recap. Preserve every detail the agent needs to keep working: nothing load-bearing may \
+be lost. Write in English. Output ONLY the summary under these exact sections:\n\
+\n\
+1. Intent & current goal: what the user is ultimately trying to achieve, in their own framing.\n\
+2. Key facts & decisions: concrete technical facts established (architecture, constraints, chosen \
+approaches) and decisions already made — with the reasoning, so they are not re-litigated.\n\
+3. Files & code touched: every file read or modified, with full paths, and the relevant \
+symbols/snippets or the substance of the changes.\n\
+4. Errors & fixes: errors encountered and how they were resolved (or are still open), so they are \
+not repeated.\n\
+5. Tool/command results worth keeping: exact values, paths, IDs, or outputs that later steps depend \
+on.\n\
+6. User instructions & constraints (verbatim): explicit requirements, preferences, and prohibitions \
+the user stated — quote them; do not paraphrase away nuance.\n\
+7. Pending tasks: what still needs to be done, in order.\n\
+8. Current state: exactly where work stands right now — the last thing done and whether it \
+succeeded.\n\
+9. Next step: the single most immediate next action, if one is clearly implied.\n\
+\n\
+Be specific with file:line references and exact names. Omit a section only if it is genuinely empty. \
+Do not add commentary, apologies, or anything outside these sections."
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

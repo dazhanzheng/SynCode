@@ -179,6 +179,79 @@ pub fn compact_for_send(
     Compacted { rung, wire, before, after }
 }
 
+/// 前导 system 前缀之后第一条消息的下标 (= 可裁切区的起点; system/tools 前缀永不动, §12)。
+pub fn first_non_system_index(msgs: &[Message]) -> usize {
+    msgs.iter().position(|m| m.role != Role::System).unwrap_or(msgs.len())
+}
+
+/// 受保护尾部的起点 = 倒数第 `keep_spans` 个 user 消息的下标 (该 user 起的若干轮保留 verbatim)。
+/// 少于 `keep_spans + 1` 个 user → `None` (没有足够老的前缀值得摘要)。
+pub fn protected_tail_start(msgs: &[Message], keep_spans: usize) -> Option<usize> {
+    let user_idxs: Vec<usize> = msgs
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i)
+        .collect();
+    if user_idxs.len() <= keep_spans {
+        return None;
+    }
+    Some(user_idxs[user_idxs.len() - keep_spans])
+}
+
+/// 把一段 messages 摊平成可读文本喂给摘要器 (角色 + 文本 + 工具调用/结果摘要; CoT 不入摘要输入)。
+pub fn flatten_for_summary(msgs: &[Message]) -> String {
+    let mut s = String::new();
+    for m in msgs {
+        let role = match m.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool_result",
+        };
+        s.push_str(&format!("\n[{role}]\n"));
+        if let Some(c) = &m.content {
+            if !c.trim().is_empty() {
+                s.push_str(c);
+                s.push('\n');
+            }
+        }
+        if let Some(tcs) = &m.tool_calls {
+            for tc in tcs {
+                s.push_str(&format!("-> call {}({})\n", tc.function.name, tc.function.arguments));
+            }
+        }
+    }
+    s
+}
+
+/// 组装带 LLM 摘要的 wire (顶档): `system 前缀` + `摘要(单条 user)` + `受预算控制的尾部投影`。
+/// 尾部仍走结构阶梯 (传 measured=None: 摘要后尾部通常很小 → Baseline)。末尾 normalize 兜底删切口孤儿。
+/// canonical 不动 (D1): 摘要只是投影侧产物。
+pub fn assemble_with_summary(
+    base: &TrimPolicy,
+    msgs: &[Message],
+    budget: &Budget,
+    floor: Rung,
+    summary: &Message,
+    boundary: usize,
+) -> Compacted {
+    let prefix_end = first_non_system_index(msgs);
+    let boundary = boundary.clamp(prefix_end, msgs.len());
+    let baseline = normalize_for_api(&base.project(msgs));
+    let before = estimate_tokens(&baseline);
+
+    let tail = &msgs[boundary..];
+    let tail_compacted = compact_for_send(base, tail, budget, None, floor);
+
+    let mut w: Vec<Message> = msgs[..prefix_end].to_vec();
+    w.push(summary.clone());
+    w.extend_from_slice(&tail_compacted.wire);
+    let wire = normalize_for_api(&w);
+    let after = estimate_tokens(&wire);
+    Compacted { rung: Rung::DropOldest, wire, before, after }
+}
+
 /// 下一个更激进的档 (反应式兜底用)。已到顶 (DropOldest) 返回 None。
 pub fn next_rung(rung: Rung) -> Option<Rung> {
     match rung {
@@ -286,5 +359,49 @@ mod tests {
         let c = compact_for_send(&TrimPolicy::default(), &log, &budget, None, Rung::Baseline);
         // 再过一遍 normalize 应幂等 (无孤儿 / 未配对)。
         assert_eq!(normalize_for_api(&c.wire).len(), c.wire.len(), "compacted wire must be structurally valid");
+    }
+
+    // ---- 摘要顶档的纯函数部分 (live LLM 调用不在此单测) ----
+
+    #[test]
+    fn first_non_system_index_skips_prefix() {
+        let log = vec![Message::system("a"), Message::system("b"), Message::user("u")];
+        assert_eq!(first_non_system_index(&log), 2);
+        assert_eq!(first_non_system_index(&[Message::system("only")]), 1);
+    }
+
+    #[test]
+    fn protected_tail_start_needs_enough_spans() {
+        let small = vec![Message::system("s"), Message::user("u1")];
+        assert!(protected_tail_start(&small, 3).is_none(), "1 user < 3 spans → nothing to summarize");
+        let log = big_log(4); // 5 个 user 轮
+        let idx = protected_tail_start(&log, 3).expect("5 users > 3 spans");
+        assert_eq!(log[idx].role, Role::User, "boundary must land on a user message");
+    }
+
+    #[test]
+    fn assemble_with_summary_replaces_prefix_keeps_tail() {
+        let log = big_log(4);
+        let boundary = protected_tail_start(&log, PROTECTED_TAIL_SPANS).expect("enough spans");
+        let summary = Message::user("[summary] earlier work compacted here");
+        let c = assemble_with_summary(
+            &TrimPolicy::default(), &log, &Budget::default(), Rung::Baseline, &summary, boundary,
+        );
+        assert_eq!(c.wire[0].role, Role::System, "system prefix preserved");
+        assert_eq!(c.wire[1].role, Role::User, "summary injected as a user message");
+        assert!(c.wire[1].content.as_deref().unwrap().contains("[summary]"));
+        // 最近的工具结果必须 verbatim 保留。
+        let recent = c.wire.iter().rev().find(|m| m.role == Role::Tool);
+        assert_eq!(recent.and_then(|m| m.content.as_deref()), Some("RECENT RESULT keep me intact"));
+        // 结构合法 + 真的变小。
+        assert_eq!(normalize_for_api(&c.wire).len(), c.wire.len(), "must be structurally valid");
+        assert!(c.after < c.before, "summary projection must shrink: {} -> {}", c.before, c.after);
+    }
+
+    #[test]
+    fn flatten_for_summary_includes_roles_and_calls() {
+        let flat = flatten_for_summary(&big_log(1));
+        assert!(flat.contains("[user]"), "{flat}");
+        assert!(flat.contains("-> call"), "tool calls should be flattened: {flat}");
     }
 }

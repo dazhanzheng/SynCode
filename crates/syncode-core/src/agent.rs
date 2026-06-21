@@ -8,7 +8,10 @@
 //! `resume_session` 从库重建内存 Session。
 
 use crate::background::BackgroundRegistry;
-use crate::compaction::{compact_for_send, next_rung, Budget, Rung};
+use crate::compaction::{
+    assemble_with_summary, compact_for_send, first_non_system_index, flatten_for_summary, next_rung,
+    protected_tail_start, Budget, Rung, PROTECTED_TAIL_SPANS,
+};
 use crate::context::ContextManager;
 use crate::file_state::FileStateCache;
 use crate::fs_scope::SharedFsScope;
@@ -68,6 +71,9 @@ pub enum AgentEvent {
 /// 后端 `InsufficientSystemResource` 的重试上限 (防永久空转, §16; 原 TODO)。
 const MAX_RESOURCE_RETRIES: u32 = 5;
 
+/// LLM 摘要顶档的连续失败熔断阈值 (借鉴 CC): 连失这么多次就不再尝试摘要 (退回纯结构阶梯)。
+const MAX_SUMMARIZE_FAILS: u32 = 3;
+
 /// 事件回调汇 (在 agent 的 async 上下文里**同步**调用; 实现应是非阻塞的, 如往 channel 投递)。
 pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
@@ -113,6 +119,12 @@ pub struct AgentLoop {
     last_prompt_tokens: Option<usize>,
     /// 反应式压缩下限档: 每个 turn 起点重置 `Baseline`; 命中 context 过长的 400 时强升一档。
     compaction_floor: Rung,
+    /// LLM 摘要顶档产物 (单条 user 消息): 一旦摘要过, 投影 = system 前缀 + 它 + 尾部。canonical 不动 (D1)。
+    summary_msg: Option<Message>,
+    /// 摘要边界 (canonical 下标): `[first_non_system .. boundary)` 已被 `summary_msg` 代表, 投影从此处起。
+    compaction_boundary: Option<usize>,
+    /// 摘要连续失败计数 (熔断): 达 `MAX_SUMMARIZE_FAILS` 后停止尝试摘要。
+    summarize_fails: u32,
 }
 
 impl AgentLoop {
@@ -134,6 +146,9 @@ impl AgentLoop {
             budget: Budget::default(),
             last_prompt_tokens: None,
             compaction_floor: Rung::Baseline,
+            summary_msg: None,
+            compaction_boundary: None,
+            summarize_fails: 0,
         }
     }
 
@@ -217,21 +232,37 @@ impl AgentLoop {
     /// 思考模式 + max 强度 (复杂 agent 场景, §7.1), 带全部工具定义。
     fn build_request(&self, session: &Session) -> ChatRequest {
         // 自动压缩控制器 (支柱 1): 度量预算 → 按信息损失递增的阶梯升级裁切 (只算 wire 投影, canonical 不动)。
-        // 压力 ≤ soft 且无反应式 floor → Baseline (今天的行为, cache-stable)。超预算才爬阶梯。
-        let compacted = compact_for_send(
-            &self.context.policy,
-            session.messages(),
-            &self.budget,
-            self.last_prompt_tokens,
-            self.compaction_floor,
-        );
-        if compacted.rung != Rung::Baseline {
-            self.emit(AgentEvent::Compacted {
-                rung: compacted.rung.label().to_string(),
-                before: compacted.before as u64,
-                after: compacted.after as u64,
-            });
-        }
+        let msgs = session.messages();
+        let compacted = match (&self.summary_msg, self.compaction_boundary) {
+            // 顶档: 已有 LLM 摘要 (且 boundary 仍落在当前 log 内) → system 前缀 + 摘要 + 尾部投影。
+            // 摘要事件在 `maybe_summarize` 里已发过一次, 这里不再每轮重发。
+            (Some(summary), Some(boundary)) if boundary < msgs.len() => assemble_with_summary(
+                &self.context.policy,
+                msgs,
+                &self.budget,
+                self.compaction_floor,
+                summary,
+                boundary,
+            ),
+            // 结构阶梯: 压力 ≤ soft 且无反应式 floor → Baseline (cache-stable)。超预算才爬。
+            _ => {
+                let c = compact_for_send(
+                    &self.context.policy,
+                    msgs,
+                    &self.budget,
+                    self.last_prompt_tokens,
+                    self.compaction_floor,
+                );
+                if c.rung != Rung::Baseline {
+                    self.emit(AgentEvent::Compacted {
+                        rung: c.rung.label().to_string(),
+                        before: c.before as u64,
+                        after: c.after as u64,
+                    });
+                }
+                c
+            }
+        };
         ChatRequest {
             model: MODEL.to_string(),
             messages: compacted.wire,
@@ -250,6 +281,70 @@ impl AgentLoop {
             stream: false,
             response_format: None,
             stream_options: None,
+        }
+    }
+
+    /// LLM 摘要顶档 (§1 阶段 4): 把旧前缀 `[system 前缀 .. 受保护尾部)` 压成一条结构化交接摘要 (user 消息)。
+    /// 仅当结构阶梯都压不下去 (server 实测超 hard 阈值) 时由 `run_turn` 调。best-effort: 失败只计数+熔断,
+    /// 绝不打断 turn。摘要进**投影侧** (`summary_msg` + `compaction_boundary`); canonical 全文 log 不动 (D1)。
+    ///
+    /// 用 user 角色注入 (无 reasoning_content → 天然规避 §7.4/§7.5 的 400, 且形成干净 user 边界)。
+    /// 摘要请求本身: 非流式、thinking 关、无工具、专用摘要 system prompt。
+    async fn maybe_summarize(&mut self, session: &Session) {
+        if self.summarize_fails >= MAX_SUMMARIZE_FAILS {
+            return; // 熔断: 连失太多次, 退回纯结构阶梯
+        }
+        let msgs = session.messages();
+        let Some(boundary) = protected_tail_start(msgs, PROTECTED_TAIL_SPANS) else {
+            return; // user 轮不足以划出「旧前缀 + 受保护尾部」
+        };
+        let prefix_end = first_non_system_index(msgs);
+        if boundary <= prefix_end {
+            return; // 没有可摘要的旧前缀
+        }
+        let flat = flatten_for_summary(&msgs[prefix_end..boundary]);
+        let req = ChatRequest {
+            model: MODEL.to_string(),
+            messages: vec![
+                Message::system(crate::prompt::summarizer_prompt()),
+                Message::user(format!("Earlier conversation to summarize:\n{flat}")),
+            ],
+            thinking: Some(Thinking { kind: ThinkingType::Disabled }),
+            reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: Some(self.budget.summary_reserve as u32),
+            temperature: None,
+            stop: None,
+            stream: false,
+            response_format: None,
+            stream_options: None,
+        };
+        let client = self.client.clone(); // 克隆 Arc 避免与下方 &mut self 借用冲突
+        let text = match client.chat(&req).await {
+            Ok(resp) => resp
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|c| c.message.content)
+                .filter(|c| !c.trim().is_empty()),
+            Err(_) => None,
+        };
+        match text {
+            Some(text) => {
+                self.summary_msg = Some(Message::user(format!(
+                    "[Compacted context — the earlier conversation was summarized to fit the context \
+                     window. The full detail remains in the session log.]\n\n{text}"
+                )));
+                self.compaction_boundary = Some(boundary);
+                self.summarize_fails = 0;
+                self.emit(AgentEvent::Compacted {
+                    rung: "summarize".to_string(),
+                    before: 0,
+                    after: 0,
+                });
+            }
+            None => self.summarize_fails += 1,
         }
     }
 
@@ -351,7 +446,7 @@ impl AgentLoop {
             }
 
             // 采纳了本次输出 → 记录 server 精确 prompt_tokens (喂回压缩控制环) + 报 token 用量。
-            if let Some(u) = &usage {
+            let over_hard = if let Some(u) = &usage {
                 self.last_prompt_tokens = Some(u.prompt_tokens as usize);
                 self.emit(AgentEvent::Usage {
                     prompt_tokens: u.prompt_tokens,
@@ -364,6 +459,14 @@ impl AgentLoop {
                         .map(|d| d.reasoning_tokens)
                         .unwrap_or(0),
                 });
+                u.prompt_tokens as usize > self.budget.hard_threshold()
+            } else {
+                false
+            };
+            // 结构阶梯都压不下去 (server 实测仍超 hard 阈值) → 上 LLM 摘要顶档。这轮已重写前缀 = 已付
+            // cache miss (cold-cache 时机), 此时摘要最划算; 熔断后退回纯结构阶梯。canonical 仍存全文 (D1)。
+            if over_hard {
+                self.maybe_summarize(session).await;
             }
 
             // assistant 全文 (含完整 reasoning_content) 回填 canonical。裁切只在发送投影侧做 (D1)。
