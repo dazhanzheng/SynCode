@@ -302,7 +302,9 @@ impl AgentLoop {
             // reasoning / 文本已在流式回调里逐字发出 (AssistantDelta/ReasoningDelta), 不再整段重发。
 
             if finish == Some(FinishReason::ToolCalls) && !tool_calls.is_empty() {
-                // 并行工具调用: 一轮可有多个 tool_calls, 逐个执行并回填结果 (§11)。
+                // 一轮可有多个 tool_calls: **刻意串行**逐个执行并回填 (§11)。
+                // 决策 (2026-06): 不并行。读类工具是 in-process 同步阻塞, join_all 在单 task 上不交错、
+                // 不提速; 真并行需上线程池, 而 per-call 性能本就被 LLM 延迟淹没 (纲领: 不追 per-call 性能)。
                 for tc in &tool_calls {
                     let result = self.dispatch_tool(tc).await;
                     self.commit(session, Message::tool_result(tc.id.as_str(), result));
