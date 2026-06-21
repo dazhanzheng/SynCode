@@ -48,10 +48,6 @@ mod color {
     pub fn danger_bg() -> Hsla { rgba(0xf8514912).into() }
 }
 
-/// 只读演示任务: 用 Read 看一个文件并总结 —— 流式好看、且不改任何东西。
-const DEMO_TASK: &str = "Read the file crates/syncode-core/src/tool.rs and briefly summarize what \
-    the `Tool` trait requires implementors to provide. Be concise.";
-
 /// UI → worker 的控制消息。Task 跑一轮 (累积进常驻 session); Reset 丢弃 session 开新会话;
 /// SetWorkspace 把 agent 的项目根 (cwd / 审批写根 / FsScope 收容根) 切到新目录并重建 + 开新会话。
 enum WorkerMsg {
@@ -141,7 +137,6 @@ impl AgentApp {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Type a task for the agent… (Enter to run)")
-                .default_value(DEMO_TASK)
         });
         // Enter → 提交 (subscribe_in 给 window, 才能清空输入框)。
         cx.subscribe_in(&input, window, |this, _input, event, window, cx| {
@@ -519,6 +514,8 @@ impl AgentApp {
     ) -> impl IntoElement {
         let theme = cx.theme();
         // tag = 工具真名 (Read/Write/Edit/Glob/Grep/AstGrep/AstEdit/Lsp/Bash/BashOutput), 不再套 "TOOL"。
+        // Bash 在 Windows 上默认跑 PowerShell, 故显示成 "PowerShell" 更贴实 (模型那边名字仍是 Bash)。
+        let display_name = if name == "Bash" && cfg!(windows) { "PowerShell" } else { name };
         // ok=teal, error=red 表状态。
         let tag_color: Hsla = if ok { color::teal() } else { color::red() };
         let summary = match result {
@@ -534,7 +531,7 @@ impl AgentApp {
             "tool",
             i,
             expanded,
-            name,
+            display_name,
             tag_color,
             summary,
             theme.muted_foreground,
@@ -926,7 +923,7 @@ impl AgentApp {
                             .border_color(theme.border)
                             .px_3()
                             .py_2()
-                            .child(TextInput::new(&self.input)),
+                            .child(TextInput::new(&self.input).appearance(false)),
                     )
                     .child(
                         Button::new("send")
