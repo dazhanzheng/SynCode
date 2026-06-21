@@ -8,11 +8,31 @@ use crate::fs_scope::SharedFsScope;
 use crate::permission::ActionRequest;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use syncode_llm::wire::{FunctionDef, ToolDef};
 use syncode_lsp::LspManager;
 use thiserror::Error;
+
+/// 派生子 agent 的请求 (§5 sub-agent 编排): 一句任务描述 + 给子 agent 的 prompt。
+#[derive(Debug, Clone)]
+pub struct SubAgentRequest {
+    /// 短描述 (展示 / 日志用)。
+    pub description: String,
+    /// 给子 agent 的实际任务 prompt。
+    pub prompt: String,
+}
+
+/// 子 agent 派生器 (由 [`AgentLoop`](crate::agent::AgentLoop) 注入): 跑一个**嵌套 agent loop** 到收尾,
+/// 只把它的最终回答返回 (中间工具调用不进编排者 context —— 这正是 sub-agent 的价值)。`Err` = 子 agent 失败。
+/// 子 agent 继承父的审批器与 cap-std 写收容 (权限**不放宽**, 只会更紧), 且**不能再派子 agent** (深度 1)。
+pub type SubAgentSpawner = Arc<
+    dyn Fn(SubAgentRequest) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// 工具执行错误。`Display` 文案直接回给模型, 故措辞要利于模型自纠偏。
 #[derive(Debug, Error)]
@@ -71,6 +91,9 @@ pub struct ToolCtx {
     pub fs: SharedFsScope,
     /// 后台任务注册表 (§5.5): Bash 的 run_in_background 在此登记, `BashOutput` 据此查/杀。跨工具调用共享。
     pub background: Arc<BackgroundRegistry>,
+    /// 子 agent 派生器 (§5 编排)。`None` = 此上下文不允许派子 agent (子 agent 内部即如此 → 深度 1)。
+    /// 由 `AgentLoop` 在启用 sub-agents 时注入。
+    pub sub_agent: Option<SubAgentSpawner>,
 }
 
 impl ToolCtx {
@@ -83,7 +106,14 @@ impl ToolCtx {
     /// `fs` 默认 None、`background` 默认新建空的; agent loop 在 dispatch 里直接字段赋值换成**共享**实例
     /// (`ctx.fs = ...; ctx.background = ...`), 故同一 AgentLoop 内跨 dispatch 一致。
     pub fn with_lsp(files: Arc<FileStateCache>, cwd: PathBuf, lsp: Arc<LspManager>) -> Self {
-        Self { files, cwd, lsp, fs: None, background: Arc::new(BackgroundRegistry::new()) }
+        Self {
+            files,
+            cwd,
+            lsp,
+            fs: None,
+            background: Arc::new(BackgroundRegistry::new()),
+            sub_agent: None,
+        }
     }
 
     /// 写类工具 (Write/Edit/AstEdit) 在落盘前调用: 挂了写收容则校验路径在授权根内, 否则放行。
@@ -93,6 +123,17 @@ impl ToolCtx {
             scope.check_writable(path).map_err(|e| ToolError::Denied(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// 派生一个子 agent 跑完 `req` 并返回其最终回答。无派生器 (深度 1 边界 / 未启用) → model-readable 错误。
+    pub async fn spawn_sub_agent(&self, req: SubAgentRequest) -> Result<String, ToolError> {
+        match &self.sub_agent {
+            Some(spawn) => spawn(req).await.map_err(ToolError::Exec),
+            None => Err(ToolError::Exec(
+                "sub-agent spawning is not available here (a sub-agent cannot spawn further sub-agents)"
+                    .into(),
+            )),
+        }
     }
 }
 

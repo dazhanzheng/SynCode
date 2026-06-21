@@ -19,7 +19,7 @@ use crate::permission::{AllowAll, Approver, Decision};
 use crate::registry::ToolRegistry;
 use crate::session::Session;
 use crate::state::SessionStore;
-use crate::tool::ToolCtx;
+use crate::tool::{SubAgentRequest, SubAgentSpawner, ToolCtx};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -125,6 +125,8 @@ pub struct AgentLoop {
     compaction_boundary: Option<usize>,
     /// 摘要连续失败计数 (熔断): 达 `MAX_SUMMARIZE_FAILS` 后停止尝试摘要。
     summarize_fails: u32,
+    /// 是否允许本 loop 派生子 agent (§5)。顶层 `true`; 派生出的子 agent 一律 `false` (深度 1, 防递归)。
+    sub_agents_enabled: bool,
 }
 
 impl AgentLoop {
@@ -149,6 +151,7 @@ impl AgentLoop {
             summary_msg: None,
             compaction_boundary: None,
             summarize_fails: 0,
+            sub_agents_enabled: false,
         }
     }
 
@@ -156,6 +159,49 @@ impl AgentLoop {
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
         self
+    }
+
+    /// 启用/禁用子 agent 派生 (§5)。顶层入口 `true` 才允许; 派生出的子 agent 内部恒 `false` (深度 1)。
+    pub fn with_sub_agents(mut self, on: bool) -> Self {
+        self.sub_agents_enabled = on;
+        self
+    }
+
+    /// 构造一个子 agent 派生器: 每次调用跑一个**嵌套** `AgentLoop` 到收尾, 只返回其最终回答。
+    /// 子 agent 继承父的 client / 工具集 / 审批器 / cap-std 写收容 / 共享 LSP+文件缓存 (权限**不放宽**),
+    /// 但 `sub_agents_enabled=false` (深度 1, 防递归) 且 `events=None` (中间过程不进编排者 transcript)。
+    fn make_spawner(&self) -> SubAgentSpawner {
+        let client = self.client.clone();
+        let tools = self.tools.clone();
+        let approver = self.approver.clone();
+        let files = self.files.clone();
+        let lsp = self.lsp.clone();
+        let fs = self.fs.clone();
+        let cwd = self.cwd.clone();
+        let budget = self.budget;
+        Arc::new(move |req: SubAgentRequest| {
+            let client = client.clone();
+            let tools = tools.clone();
+            let approver = approver.clone();
+            let files = files.clone();
+            let lsp = lsp.clone();
+            let fs = fs.clone();
+            let cwd = cwd.clone();
+            Box::pin(async move {
+                let mut nested = AgentLoop::new(client, tools)
+                    .with_approver(approver)
+                    .with_fs_scope(fs)
+                    .with_cwd(cwd.clone())
+                    .with_budget(budget);
+                // 共享父的 LSP 常驻服务器与文件缓存 (高效); sub_agents_enabled 保持 new() 默认 false。
+                nested.files = files;
+                nested.lsp = lsp;
+                let mut session = Session::with_system(crate::prompt::sub_agent_prompt(&cwd));
+                session.push_user(format!("{}\n\n{}", req.description, req.prompt));
+                nested.run_turn(&mut session).await.map_err(|e| e.to_string())?;
+                Ok(last_assistant_text(&session))
+            })
+        })
     }
 
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
@@ -569,6 +615,10 @@ impl AgentLoop {
         let mut ctx = ToolCtx::with_lsp(self.files.clone(), self.cwd.clone(), self.lsp.clone());
         ctx.fs = self.fs.clone();
         ctx.background = self.background.clone();
+        // 启用 sub-agents 时注入派生器 (子 agent 内部不启用 → 其 ctx.sub_agent 为 None, 深度 1)。
+        if self.sub_agents_enabled {
+            ctx.sub_agent = Some(self.make_spawner());
+        }
         match tool.call(args, &ctx).await {
             Ok(out) if out.is_error => format!("<tool_use_error>{}</tool_use_error>", out.content),
             Ok(out) => {
@@ -584,6 +634,20 @@ impl AgentLoop {
             Err(e) => format!("<tool_use_error>{e}</tool_use_error>"),
         }
     }
+}
+
+/// 取会话里最后一条非空 assistant 文本 (子 agent 的最终回答, 返给编排者)。
+fn last_assistant_text(session: &Session) -> String {
+    session
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == syncode_llm::wire::Role::Assistant
+                && m.content.as_deref().is_some_and(|c| !c.trim().is_empty())
+        })
+        .and_then(|m| m.content.clone())
+        .unwrap_or_else(|| "(sub-agent produced no final answer)".to_string())
 }
 
 /// 是否「context 过长」类的 400 (反应式压缩兜底用): estimate 低估漏过预算时, DeepSeek 直接以

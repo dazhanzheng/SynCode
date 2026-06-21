@@ -1335,6 +1335,7 @@ fn run_agent_worker(
                 .with_approver(Arc::new(PolicyApprover::new(root)))
                 .with_fs_scope(Some(Arc::new(FsScope::new(root))))
                 .with_cwd(root)
+                .with_sub_agents(true) // 顶层启用子 agent 派生 (深度 1)
                 .with_event_sink(sink.clone())
                 .with_ask_gate(gate.clone());
             if let Some(db) = &db_path {

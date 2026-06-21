@@ -41,7 +41,8 @@ async fn main() {
     let mut agent = AgentLoop::new(Arc::new(client), registry)
         .with_approver(Arc::new(PolicyApprover::new(&project_root)))
         .with_fs_scope(Some(Arc::new(FsScope::new(&project_root))))
-        .with_cwd(&project_root);
+        .with_cwd(&project_root)
+        .with_sub_agents(true); // 顶层启用子 agent 派生 (子 agent 内部恒禁用, 深度 1)
 
     let task: String = {
         let args: Vec<String> = std::env::args().skip(1).collect();

@@ -15,6 +15,7 @@ mod grep;
 mod lsp;
 mod read;
 mod script;
+mod subagent;
 mod write;
 
 #[cfg(test)]
@@ -30,6 +31,7 @@ pub use grep::GrepTool;
 pub use lsp::LspTool;
 pub use read::ReadTool;
 pub use script::ScriptTool;
+pub use subagent::SubAgentTool;
 pub use write::WriteTool;
 
 use std::sync::Arc;
@@ -46,6 +48,7 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Arc::new(AstEditTool));
     registry.register(Arc::new(LspTool));
     registry.register(Arc::new(ScriptTool));
+    registry.register(Arc::new(SubAgentTool));
     registry.register(Arc::new(BashTool));
     registry.register(Arc::new(BashOutputTool));
 }

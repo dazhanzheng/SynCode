@@ -5,6 +5,7 @@
 //! 原则: canonical **只前进或截断到 checkpoint**, 不改历史内容 —— 失败尝试丢弃即可, 不会「一直后退」。
 
 use rusqlite::{params, Connection};
+use std::sync::Mutex;
 use syncode_llm::wire::Message;
 use thiserror::Error;
 
@@ -19,8 +20,11 @@ pub enum StateError {
 pub type Result<T> = std::result::Result<T, StateError>;
 
 /// 一个 session 的 append-only 事件存储 + checkpoint。
+///
+/// `Connection` 用 `Mutex` 包裹 —— 使 `SessionStore` (及持有它的 `AgentLoop`) 成为 `Send + Sync`,
+/// 从而 agent 的 future 可在多线程 runtime 上安全使用 (子 agent 派生需要 loop 的 future 为 `Send`)。
 pub struct SessionStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl SessionStore {
@@ -49,14 +53,15 @@ impl SessionStore {
                  seq        INTEGER NOT NULL
              );",
         )?;
-        Ok(Self { conn })
+        Ok(Self { conn: Mutex::new(conn) })
     }
 
     /// 追加一条消息到 canonical log, 返回其 seq (从 0 起, 每 session 独立)。
     pub fn append(&self, session_id: &str, message: &Message) -> Result<i64> {
-        let seq = self.next_seq(session_id)?;
+        let conn = self.conn.lock().unwrap();
+        let seq = max_seq(&conn, session_id)? + 1;
         let body = serde_json::to_string(message)?;
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO events (session_id, seq, role, body) VALUES (?1, ?2, ?3, ?4)",
             params![session_id, seq, role_str(message), body],
         )?;
@@ -65,9 +70,9 @@ impl SessionStore {
 
     /// 载入 canonical 全文 log (按 seq 升序)。
     pub fn load(&self, session_id: &str) -> Result<Vec<Message>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT body FROM events WHERE session_id = ?1 ORDER BY seq")?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT body FROM events WHERE session_id = ?1 ORDER BY seq")?;
         let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -78,7 +83,8 @@ impl SessionStore {
 
     /// 当前事件数。
     pub fn len(&self, session_id: &str) -> Result<usize> {
-        let n: i64 = self.conn.query_row(
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM events WHERE session_id = ?1",
             params![session_id],
             |r| r.get(0),
@@ -92,8 +98,9 @@ impl SessionStore {
 
     /// 打一个 checkpoint (记录当前最大 seq), 返回该 seq (空 log 为 -1)。
     pub fn checkpoint(&self, session_id: &str, label: &str) -> Result<i64> {
-        let seq = self.max_seq(session_id)?;
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        let seq = max_seq(&conn, session_id)?;
+        conn.execute(
             "INSERT INTO checkpoints (session_id, label, seq) VALUES (?1, ?2, ?3)",
             params![session_id, label, seq],
         )?;
@@ -102,24 +109,22 @@ impl SessionStore {
 
     /// 回滚: 删除 `seq > up_to_seq` 的事件 (截断到某 checkpoint)。后续 append 从截断点续号。
     pub fn rollback(&self, session_id: &str, up_to_seq: i64) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "DELETE FROM events WHERE session_id = ?1 AND seq > ?2",
             params![session_id, up_to_seq],
         )?;
         Ok(())
     }
+}
 
-    fn max_seq(&self, session_id: &str) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COALESCE(MAX(seq), -1) FROM events WHERE session_id = ?1",
-            params![session_id],
-            |r| r.get(0),
-        )?)
-    }
-
-    fn next_seq(&self, session_id: &str) -> Result<i64> {
-        Ok(self.max_seq(session_id)? + 1)
-    }
+/// 某 session 当前最大 seq (空 log 为 -1)。取已锁的 `&Connection` 以避免可重入死锁。
+fn max_seq(conn: &Connection, session_id: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(seq), -1) FROM events WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?)
 }
 
 fn role_str(m: &Message) -> &'static str {
