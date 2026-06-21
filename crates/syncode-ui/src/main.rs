@@ -15,6 +15,8 @@ use std::thread;
 
 use gpui::*;
 use gpui_component::input::{Input as TextInput, InputEvent, InputState};
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
+use gpui_component::text::TextView;
 use gpui_component::{button::*, *};
 use syncode_core::permission::{ActionRequest, Decision, PolicyApprover};
 use syncode_core::{AgentEvent, AgentLoop, AskGate, EventSink, FsScope, Session, ToolRegistry};
@@ -148,6 +150,9 @@ impl AgentApp {
     }
 
     fn apply(&mut self, event: AgentEvent) {
+        // 黏底: 加内容前判断用户是否在底部附近 (基于上一帧)。在底 → 继续跟随最新; 已上滚 →
+        // 不再强拉回底, 这样长结果展开后能从容滚到顶部点收起 (修复「滚不回收起处」)。
+        let stick = self.near_bottom();
         match event {
             AgentEvent::AssistantText(t) => self.lines.push(Line::Assistant(t)),
             AgentEvent::Reasoning { text } => {
@@ -177,7 +182,15 @@ impl AgentApp {
                 self.running = false;
             }
         }
-        self.scroll.scroll_to_bottom();
+        if stick {
+            self.scroll.scroll_to_bottom();
+        }
+    }
+
+    /// 当前滚动位置是否在底部附近 (距底 < 48px)。`offset().y` 向下为负, `max_offset().y` 为最大下滚
+    /// 距离, 故「距底 = max_offset.y + offset.y」, 触底时 ≈ 0。内容未溢出时两者皆 0 → 视为在底。
+    fn near_bottom(&self) -> bool {
+        (self.scroll.max_offset().y + self.scroll.offset().y) < px(48.)
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -290,6 +303,22 @@ impl AgentApp {
                 .border_color(rgba(0x6675ff2b));
         }
         block.into_any_element()
+    }
+
+    /// assistant 回答: 角色 tag + **markdown 渲染** (标题/列表/粗体/行内码/代码块/链接), 可选中复制。
+    /// 用 gpui-component 的 `TextView::markdown` (内建解析 + 高亮)。id 用行下标保持稳定。
+    fn render_assistant(&self, i: usize, text: &str, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let tag: Hsla = rgb(0x4ec9b0).into();
+        v_flex()
+            .gap_1()
+            .child(div().text_xs().font_bold().text_color(tag).child("SYNCODE"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(TextView::markdown(("assistant", i), text.to_string()).selectable(true)),
+            )
     }
 
     /// 可折叠区块共用的 header: 可点击 (chevron + 角色 tag + 摘要), 圆角内边距, 翻转 `expanded`。
@@ -500,6 +529,7 @@ impl Render for AgentApp {
                 Line::Diff { path, text, expanded } => {
                     self.render_diff(i, path, text, *expanded, cx).into_any_element()
                 }
+                Line::Assistant(text) => self.render_assistant(i, text, cx).into_any_element(),
                 other => self.render_line(other, cx).into_any_element(),
             })
             .collect();
@@ -513,16 +543,28 @@ impl Render for AgentApp {
                 .py_5()
                 .gap_4()
                 .child(self.render_header(running, cx))
-                // transcript (可滚动, 占满中间)
+                // transcript: relative 容器 = 可滚动内容 + 右侧常显滚动条 overlay (照 gpui-component
+                // render_scrollbar 范式: 滚动条是全屏 absolute 叠层, 只在 thumb 处命中, 不挡内容点击)。
                 .child(
-                    v_flex()
-                        .id("transcript")
+                    div()
+                        .relative()
                         .flex_1()
-                        .gap_3()
-                        .pr_2()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .children(rows),
+                        .child(
+                            v_flex()
+                                .id("transcript")
+                                .size_full()
+                                .gap_3()
+                                .pr_3()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll)
+                                .children(rows),
+                        )
+                        .child(
+                            div().absolute().top_0().left_0().right_0().bottom_0().child(
+                                Scrollbar::vertical(&self.scroll)
+                                    .scrollbar_show(ScrollbarShow::Always),
+                            ),
+                        ),
                 )
                 // 审批卡片 (仅在有在途 Ask 请求时): 阻塞中, 等人点 Allow once / Deny。
                 .children(self.pending_approval.as_ref().map(|p| self.render_approval(p, cx)))
