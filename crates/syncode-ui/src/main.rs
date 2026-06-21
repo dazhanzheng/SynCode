@@ -180,6 +180,24 @@ impl AgentApp {
         self.lines = lines;
     }
 
+    /// 翻转第 `i` 行的展开状态 (Tool / Reasoning / Diff 通用)。header 和**展开后的卡片本身**都用它,
+    /// 所以点击展开的卡片任意处就能折叠 (不必滚回头部)。高度变 → 重测该项。
+    fn toggle_expanded(&mut self, i: usize, cx: &mut Context<Self>) {
+        let toggled = match self.lines.get_mut(i) {
+            Some(Line::Tool { expanded, .. })
+            | Some(Line::Reasoning { expanded, .. })
+            | Some(Line::Diff { expanded, .. }) => {
+                *expanded = !*expanded;
+                true
+            }
+            _ => false,
+        };
+        if toggled {
+            self.list_state.remeasure_items(i..i + 1);
+            cx.notify();
+        }
+    }
+
     /// 人对在途审批请求作答: 把决定回送给 worker (解阻塞 agent), 清掉卡片。
     fn resolve_approval(&mut self, decision: Decision, cx: &mut Context<Self>) {
         if let Some(p) = self.pending_approval.take() {
@@ -410,7 +428,6 @@ impl AgentApp {
         summary_color: Hsla,
         copy_text: String,
         cx: &Context<Self>,
-        toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         let theme = cx.theme();
         let glyph = if expanded { "▾" } else { "▸" };
@@ -428,7 +445,7 @@ impl AgentApp {
                     .py_1()
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _ev, _window, cx| toggle(this, cx)))
+                    .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_expanded(i, cx)))
                     .child(div().w(px(12.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(glyph))
                     .child(div().flex_shrink_0().text_xs().font_bold().text_color(tag_color).child(tag.to_string()))
                     .child(div().flex_1().text_sm().text_color(summary_color).child(summary)),
@@ -470,18 +487,15 @@ impl AgentApp {
             theme.muted_foreground,
             copy_text,
             cx,
-            move |this, cx| {
-                if let Some(Line::Tool { expanded, .. }) = this.lines.get_mut(i) {
-                    *expanded = !*expanded;
-                    this.list_state.remeasure_items(i..i + 1);
-                    cx.notify();
-                }
-            },
         );
 
         let mut col = v_flex().gap_1().child(header);
         if expanded {
+            // 卡片本身可点 → 点任意处折叠 (长结果不必滚回头部)。
             let mut card = v_flex()
+                .id(("body", i))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_expanded(i, cx)))
                 .ml(px(20.))
                 .gap_2()
                 .p_3()
@@ -519,19 +533,15 @@ impl AgentApp {
             theme.muted_foreground,
             text.to_string(),
             cx,
-            move |this, cx| {
-                if let Some(Line::Reasoning { expanded, .. }) = this.lines.get_mut(i) {
-                    *expanded = !*expanded;
-                    this.list_state.remeasure_items(i..i + 1);
-                    cx.notify();
-                }
-            },
         );
 
         let mut col = v_flex().gap_1().child(header);
         if expanded {
             col = col.child(
                 div()
+                    .id(("body", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_expanded(i, cx)))
                     .ml(px(20.))
                     .p_3()
                     .rounded(px(8.))
@@ -568,13 +578,6 @@ impl AgentApp {
             theme.foreground,
             text.to_string(),
             cx,
-            move |this, cx| {
-                if let Some(Line::Diff { expanded, .. }) = this.lines.get_mut(i) {
-                    *expanded = !*expanded;
-                    this.list_state.remeasure_items(i..i + 1);
-                    cx.notify();
-                }
-            },
         );
 
         let mut col = v_flex().gap_1().child(header);
@@ -598,6 +601,9 @@ impl AgentApp {
                 .collect();
             col = col.child(
                 v_flex()
+                    .id(("body", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_expanded(i, cx)))
                     .ml(px(20.))
                     .p_3()
                     .rounded(px(8.))
