@@ -15,7 +15,7 @@ use std::thread;
 
 use gpui::*;
 use gpui_component::input::{Input as TextInput, InputEvent, InputState};
-use gpui_component::scroll::{Scrollbar, ScrollbarShow};
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::TextView;
 use gpui_component::{button::*, *};
 use syncode_core::permission::{ActionRequest, Decision, PolicyApprover};
@@ -603,28 +603,20 @@ impl Render for AgentApp {
                 .py_5()
                 .gap_4()
                 .child(self.render_header(running, cx))
-                // transcript: relative 容器 = 可滚动内容 + 右侧常显滚动条 overlay (照 gpui-component
-                // render_scrollbar 范式: 滚动条是全屏 absolute 叠层, 只在 thumb 处命中, 不挡内容点击)。
+                // transcript: 可滚动 + 竖向滚动条。用 gpui-component 的 `vertical_scrollbar` 扩展
+                // (把滚动条正确接进滚动元素), 而非手搓全屏 overlay —— 后者的全屏 hitbox 会吞掉内容区
+                // 的滚轮事件 (导致滚轮滚不动)。滚动条默认随滚动出现、空闲淡出。
                 .child(
-                    div()
+                    v_flex()
+                        .id("transcript")
                         .relative()
                         .flex_1()
-                        .child(
-                            v_flex()
-                                .id("transcript")
-                                .size_full()
-                                .gap_3()
-                                .pr_3()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.scroll)
-                                .children(rows),
-                        )
-                        .child(
-                            div().absolute().top_0().left_0().right_0().bottom_0().child(
-                                Scrollbar::vertical(&self.scroll)
-                                    .scrollbar_show(ScrollbarShow::Always),
-                            ),
-                        ),
+                        .gap_3()
+                        .pr_3()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .children(rows)
+                        .vertical_scrollbar(&self.scroll),
                 )
                 // 审批卡片 (仅在有在途 Ask 请求时): 阻塞中, 等人点 Allow once / Deny。
                 .children(self.pending_approval.as_ref().map(|p| self.render_approval(p, cx)))
