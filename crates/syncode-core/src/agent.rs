@@ -19,7 +19,7 @@ use crate::permission::{AllowAll, Approver, Decision};
 use crate::registry::ToolRegistry;
 use crate::session::Session;
 use crate::state::SessionStore;
-use crate::tool::{SubAgentRequest, SubAgentSpawner, ToolCtx};
+use crate::tool::{SubAgentRequest, SubAgentSpawner, TodoItem, ToolCtx};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -62,6 +62,8 @@ pub enum AgentEvent {
     /// 触发了一次自动 context 压缩 (爬上 Baseline 以上的档): `rung` = 档位名,
     /// `before`/`after` = 压缩前后的 token 估算 (供 UI / eval 观测压缩决策)。
     Compacted { rung: String, before: u64, after: u64 },
+    /// 任务清单更新 (TodoWrite): 携带更新后的完整清单, 供 UI 渲染清单面板。
+    Todos(Vec<TodoItem>),
     /// turn 正常结束。
     TurnDone,
     /// turn 被用户中止 (Stop)。会话已被 `repair_after_interrupt` 修复成可继续状态。
@@ -628,6 +630,10 @@ impl AgentLoop {
                         path: d.path.clone(),
                         diff: d.unified.clone(),
                     });
+                }
+                // TodoWrite 带了清单 → 发 Todos 事件 (供 UI 渲染清单面板)。不进给模型的 content。
+                if let Some(t) = &out.todos {
+                    self.emit(AgentEvent::Todos(t.clone()));
                 }
                 out.content
             }

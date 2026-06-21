@@ -20,7 +20,9 @@ use gpui_component::text::TextView;
 use gpui_component::{button::*, *};
 use syncode_core::permission::{ActionRequest, Decision, PolicyApprover};
 use syncode_core::state::SessionStore;
-use syncode_core::{AgentEvent, AgentLoop, AskGate, EventSink, FsScope, Session, ToolRegistry};
+use syncode_core::{
+    AgentEvent, AgentLoop, AskGate, EventSink, FsScope, Session, TodoItem, TodoStatus, ToolRegistry,
+};
 use syncode_llm::wire::{Message, Role};
 use syncode_llm::{DeepSeekClient, DeepSeekConfig};
 use syncode_tools::register_builtins;
@@ -95,6 +97,8 @@ enum Line {
     Reasoning { text: String, expanded: bool },
     /// 一次文件改动的 unified diff (可折叠, 默认展开): 按 +/-/@ 前缀逐行着色。
     Diff { path: String, text: String, expanded: bool },
+    /// 任务清单面板 (TodoWrite): 整表替换、就地更新 (见 `cur_todos`)。
+    Todos(Vec<TodoItem>),
     Status(String),
 }
 
@@ -111,6 +115,8 @@ struct AgentApp {
     /// 流式: 当前正在追加的 assistant / reasoning 行下标 (delta 到了就 append 到它; 非 delta 事件清空)。
     cur_assistant: Option<usize>,
     cur_reasoning: Option<usize>,
+    /// 任务清单面板所在行下标 (TodoWrite 整表替换时就地更新该行, 不重复 push)。
+    cur_todos: Option<usize>,
     /// 流式: 本轮尚未被 Usage 精确值校准的「在途」字符数 (÷4 估成 token, 让 out/think 边生成边涨)。
     live_out_chars: usize,
     live_think_chars: usize,
@@ -203,6 +209,7 @@ impl AgentApp {
             usage: UsageTotals::default(),
             cur_assistant: None,
             cur_reasoning: None,
+            cur_todos: None,
             live_out_chars: 0,
             live_think_chars: 0,
             pending_approval: None,
@@ -224,6 +231,7 @@ impl AgentApp {
     fn reset_lines(&mut self, lines: Vec<Line>) {
         self.list_state.reset(lines.len());
         self.lines = lines;
+        self.cur_todos = None; // 清单面板下标随 transcript 失效
     }
 
     /// 翻转第 `i` 行的展开状态 (Tool / Reasoning / Diff 通用)。header 和**展开后的卡片本身**都用它,
@@ -315,6 +323,21 @@ impl AgentApp {
                 self.live_out_chars = 0;
                 self.live_think_chars = 0;
             }
+            AgentEvent::Todos(todos) => {
+                // 整表替换: 若已有清单面板行就**就地更新**, 否则新建一行并记下位置。
+                match self.cur_todos {
+                    Some(i) if matches!(self.lines.get(i), Some(Line::Todos(_))) => {
+                        self.lines[i] = Line::Todos(todos);
+                        self.list_state.remeasure_items(i..i + 1);
+                    }
+                    _ => {
+                        let n = self.lines.len();
+                        self.lines.push(Line::Todos(todos));
+                        self.list_state.splice(n..n, 1);
+                        self.cur_todos = Some(n);
+                    }
+                }
+            }
             AgentEvent::Compacted { rung, before, after } => {
                 // 自动 context 压缩触发 (支柱 1): 让用户看见「裁切」真的在发生 + 压了多少。
                 let msg = if before > 0 {
@@ -394,6 +417,18 @@ impl AgentApp {
                 Line::Reasoning { text, .. } => out.push_str(&format!("## reasoning\n{text}\n\n")),
                 Line::Diff { path, text, .. } => {
                     out.push_str(&format!("## diff: {path}\n{text}\n\n"))
+                }
+                Line::Todos(items) => {
+                    out.push_str("## plan\n");
+                    for it in items {
+                        let g = match it.status {
+                            TodoStatus::Completed => "[x]",
+                            TodoStatus::InProgress => "[~]",
+                            TodoStatus::Pending => "[ ]",
+                        };
+                        out.push_str(&format!("{g} {}\n", it.content));
+                    }
+                    out.push('\n');
                 }
                 Line::Status(t) => out.push_str(&format!("· {t}\n\n")),
             }
@@ -493,6 +528,31 @@ impl AgentApp {
             }
             Line::Diff { path, .. } => {
                 self.msg_block("DIFF", color::blue(), path, false, cx)
+            }
+            // 任务清单面板: PLAN tag + 逐项 (☑ 完成=暗 / ▶ 进行中=teal / ☐ 待办)。
+            Line::Todos(items) => {
+                let mut col = v_flex()
+                    .gap_1()
+                    .p_2()
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded_md()
+                    .child(div().text_xs().text_color(color::amber()).child("PLAN"));
+                for it in items {
+                    let (glyph, c) = match it.status {
+                        TodoStatus::Completed => ("☑", theme.muted_foreground),
+                        TodoStatus::InProgress => ("▶", color::teal()),
+                        TodoStatus::Pending => ("☐", theme.foreground),
+                    };
+                    col = col.child(
+                        h_flex()
+                            .gap_2()
+                            .items_start()
+                            .child(div().text_sm().text_color(c).child(glyph))
+                            .child(div().text_sm().text_color(c).child(it.content.clone())),
+                    );
+                }
+                col.into_any_element()
             }
         }
     }

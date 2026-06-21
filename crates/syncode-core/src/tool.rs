@@ -7,6 +7,7 @@ use crate::file_state::FileStateCache;
 use crate::fs_scope::SharedFsScope;
 use crate::permission::ActionRequest;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,22 @@ use std::sync::Arc;
 use syncode_llm::wire::{FunctionDef, ToolDef};
 use syncode_lsp::LspManager;
 use thiserror::Error;
+
+/// 一条待办的状态 (TodoWrite, §5)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// 一条任务清单项 (TodoWrite, §5): 让模型把多步任务**外化**成耐久计划, 不跑偏。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
 
 /// 派生子 agent 的请求 (§5 sub-agent 编排): 一句任务描述 + 给子 agent 的 prompt。
 #[derive(Debug, Clone)]
@@ -62,18 +79,25 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// 可选: 本次文件改动的 unified diff (编辑类工具产出)。仅供 UI 渲染, **不回给模型**。
     pub diff: Option<FileDiff>,
+    /// 可选: 本次更新后的任务清单 (TodoWrite 产出)。供 UI 渲染清单面板, **不影响**给模型的 content。
+    pub todos: Option<Vec<TodoItem>>,
 }
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false, diff: None }
+        Self { content: content.into(), is_error: false, diff: None, todos: None }
     }
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true, diff: None }
+        Self { content: content.into(), is_error: true, diff: None, todos: None }
     }
     /// 附带本次改动的 unified diff (供 UI; 不影响给模型的 content)。
     pub fn with_diff(mut self, diff: FileDiff) -> Self {
         self.diff = Some(diff);
+        self
+    }
+    /// 附带更新后的任务清单 (供 UI; 不影响给模型的 content)。
+    pub fn with_todos(mut self, todos: Vec<TodoItem>) -> Self {
+        self.todos = Some(todos);
         self
     }
 }
