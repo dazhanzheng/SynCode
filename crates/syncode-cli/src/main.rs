@@ -48,13 +48,7 @@ async fn main() {
         if args.is_empty() { DEFAULT_TASK.to_string() } else { args.join(" ") }
     };
 
-    let mut session = Session::with_system(
-        "You are SynCode, an autonomous coding agent operating inside a Rust workspace. You have file \
-         tools (Glob to list files, Read/Write/Edit), structural search/rewrite (Grep/AstGrep/AstEdit), \
-         code intelligence (Lsp), and a Bash tool. Use absolute paths. Prefer Glob over `ls`/`find` \
-         to list files. Locate code with Grep/AstGrep/Lsp before editing. After editing, compile with \
-         cargo via Bash and fix any errors. Be concise.",
-    );
+    let mut session = Session::with_system(syncode_core::system_prompt(&project_root));
     session.push_user(&task);
 
     println!("\n=== task ===\n{task}\n\n=== running against deepseek (one turn, multi tool-call) ===\n");

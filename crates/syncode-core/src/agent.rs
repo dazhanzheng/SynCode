@@ -8,6 +8,7 @@
 //! `resume_session` 从库重建内存 Session。
 
 use crate::background::BackgroundRegistry;
+use crate::compaction::{compact_for_send, next_rung, Budget, Rung};
 use crate::context::ContextManager;
 use crate::file_state::FileStateCache;
 use crate::fs_scope::SharedFsScope;
@@ -22,7 +23,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use syncode_lsp::LspManager;
 use syncode_llm::client::{DeepSeekClient, MODEL};
-use syncode_llm::context::normalize_for_api;
 use syncode_llm::stream::ChatStreamChunk;
 use syncode_llm::wire::{
     ChatRequest, FinishReason, FunctionCall, Message, ReasoningEffort, Thinking, ThinkingType,
@@ -56,11 +56,17 @@ pub enum AgentEvent {
         cache_hit_tokens: u64,
         reasoning_tokens: u64,
     },
+    /// 触发了一次自动 context 压缩 (爬上 Baseline 以上的档): `rung` = 档位名,
+    /// `before`/`after` = 压缩前后的 token 估算 (供 UI / eval 观测压缩决策)。
+    Compacted { rung: String, before: u64, after: u64 },
     /// turn 正常结束。
     TurnDone,
     /// turn 被用户中止 (Stop)。会话已被 `repair_after_interrupt` 修复成可继续状态。
     Interrupted,
 }
+
+/// 后端 `InsufficientSystemResource` 的重试上限 (防永久空转, §16; 原 TODO)。
+const MAX_RESOURCE_RETRIES: u32 = 5;
 
 /// 事件回调汇 (在 agent 的 async 上下文里**同步**调用; 实现应是非阻塞的, 如往 channel 投递)。
 pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
@@ -101,6 +107,12 @@ pub struct AgentLoop {
     /// 可选持久化 (D2/D4)。无则纯内存。
     store: Option<SessionStore>,
     session_id: String,
+    /// 自动压缩预算 (支柱 1): 决定 soft/hard 阈值。
+    budget: Budget,
+    /// 上一轮 server 回传的精确 prompt_tokens (喂回压缩控制环, 纠正 estimate 低估)。
+    last_prompt_tokens: Option<usize>,
+    /// 反应式压缩下限档: 每个 turn 起点重置 `Baseline`; 命中 context 过长的 400 时强升一档。
+    compaction_floor: Rung,
 }
 
 impl AgentLoop {
@@ -119,7 +131,16 @@ impl AgentLoop {
             ask_gate: None,
             store: None,
             session_id: "default".to_string(),
+            budget: Budget::default(),
+            last_prompt_tokens: None,
+            compaction_floor: Rung::Baseline,
         }
+    }
+
+    /// 覆盖自动压缩预算 (按模型窗口尺寸调 soft/hard 阈值)。
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
     }
 
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
@@ -195,10 +216,25 @@ impl AgentLoop {
     /// 组装一次请求: 从 canonical 投影出裁切后的 wire messages + 结构 normalize (③),
     /// 思考模式 + max 强度 (复杂 agent 场景, §7.1), 带全部工具定义。
     fn build_request(&self, session: &Session) -> ChatRequest {
-        let wire = normalize_for_api(&self.context.project(session.messages()));
+        // 自动压缩控制器 (支柱 1): 度量预算 → 按信息损失递增的阶梯升级裁切 (只算 wire 投影, canonical 不动)。
+        // 压力 ≤ soft 且无反应式 floor → Baseline (今天的行为, cache-stable)。超预算才爬阶梯。
+        let compacted = compact_for_send(
+            &self.context.policy,
+            session.messages(),
+            &self.budget,
+            self.last_prompt_tokens,
+            self.compaction_floor,
+        );
+        if compacted.rung != Rung::Baseline {
+            self.emit(AgentEvent::Compacted {
+                rung: compacted.rung.label().to_string(),
+                before: compacted.before as u64,
+                after: compacted.after as u64,
+            });
+        }
         ChatRequest {
             model: MODEL.to_string(),
-            messages: wire,
+            messages: compacted.wire,
             thinking: Some(Thinking { kind: ThinkingType::Enabled }),
             reasoning_effort: Some(ReasoningEffort::Max),
             // 无工具时不发 tools 字段; 思考模式下 tool_choice 只能 None/auto/none (传 required 会 400)。
@@ -242,12 +278,14 @@ impl AgentLoop {
     /// 跑一个完整 turn 直到模型给出非 `ToolCalls`(且非 leaked tool-call)的 `finish_reason`。
     pub async fn run_turn(&mut self, session: &mut Session) -> syncode_llm::Result<()> {
         self.sync_and_checkpoint(session);
+        self.compaction_floor = Rung::Baseline; // 每个 turn 重置反应式压缩下限
+        let mut resource_retries = 0u32;
         loop {
             let request = self.build_request(session);
             // 流式: 逐 chunk 把 assistant 文本 / reasoning 增量发给 UI (实时逐字 + token 边生成边涨)。
             // sink 是 self.events 的克隆 (独立 Arc, 不借 self), 故与 self.client 的方法借用不冲突。
             let sink = self.events.clone();
-            let response = self
+            let response = match self
                 .client
                 .chat_streaming(&request, |chunk: &ChatStreamChunk| {
                     if let Some(s) = &sink {
@@ -265,7 +303,26 @@ impl AgentLoop {
                         }
                     }
                 })
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // 反应式兜底: estimate 低估漏过、DeepSeek 以 context 过长的 400 拒 → 强升一档压缩重试。
+                    // 每次升一档 (至多到 DropOldest); next_rung 到顶返回 None → 透传错误。天然有界。
+                    if is_context_length_error(&e) {
+                        if let Some(next) = next_rung(self.compaction_floor) {
+                            self.compaction_floor = next;
+                            self.emit(AgentEvent::Compacted {
+                                rung: format!("reactive:{}", next.label()),
+                                before: 0,
+                                after: 0,
+                            });
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             let usage = response.usage.clone();
             let choice = response
                 .choices
@@ -275,13 +332,27 @@ impl AgentLoop {
             let finish = choice.finish_reason;
             let message = choice.message;
 
-            // 后端算力不足被中断 (§16): 不采纳本次输出, 重发。(TODO: 加重试上限。)
+            // 后端算力不足被中断 (§16): 不采纳本次输出, 退避后重发; 封顶防永久空转 (原 TODO)。
             if finish == Some(FinishReason::InsufficientSystemResource) {
+                resource_retries += 1;
+                if resource_retries > MAX_RESOURCE_RETRIES {
+                    return Err(syncode_llm::Error::Api {
+                        status: 503,
+                        code: Some("insufficient_system_resource".to_string()),
+                        message: format!(
+                            "backend returned insufficient_system_resource {MAX_RESOURCE_RETRIES} times in a row"
+                        ),
+                        retry_after_secs: None,
+                    });
+                }
+                let delay = syncode_llm::error::backoff_delay(resource_retries, None, 0.0);
+                tokio::time::sleep(delay).await;
                 continue;
             }
 
-            // 采纳了本次输出 → 报 token 用量 (UI 累计展示)。
+            // 采纳了本次输出 → 记录 server 精确 prompt_tokens (喂回压缩控制环) + 报 token 用量。
             if let Some(u) = &usage {
+                self.last_prompt_tokens = Some(u.prompt_tokens as usize);
                 self.emit(AgentEvent::Usage {
                     prompt_tokens: u.prompt_tokens,
                     completion_tokens: u.completion_tokens,
@@ -409,6 +480,21 @@ impl AgentLoop {
             }
             Err(e) => format!("<tool_use_error>{e}</tool_use_error>"),
         }
+    }
+}
+
+/// 是否「context 过长」类的 400 (反应式压缩兜底用): estimate 低估漏过预算时, DeepSeek 直接以
+/// 400 拒收过长 prompt。**保守**判定 (避免把别的 400 误当上下文超长): 仅 status==400 且 message
+/// 明确提到 context/maximum length/too long。命中则强升一档压缩重试 (见 `run_turn`)。
+fn is_context_length_error(e: &syncode_llm::Error) -> bool {
+    if let syncode_llm::Error::Api { status: 400, message, .. } = e {
+        let m = message.to_lowercase();
+        m.contains("context length")
+            || m.contains("maximum context")
+            || m.contains("too long")
+            || (m.contains("context") && m.contains("token"))
+    } else {
+        false
     }
 }
 

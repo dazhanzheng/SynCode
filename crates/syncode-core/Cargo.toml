@@ -12,8 +12,6 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
+tokio = { workspace = true }
 syncode-llm = { workspace = true }
 syncode-lsp = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }

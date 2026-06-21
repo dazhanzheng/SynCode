@@ -1,7 +1,7 @@
 //! SynCode 内置工具 (借鉴 Claude Code 工具设计 IP, 用 Rust 重写, 架构 §10)。
 //!
-//! 当前为 stub: 契约 (名称/描述/JSON Schema) 立起来, `call` 为 `todo!()`。
-//! 抬上限的方向 (§4) 在各工具 doc 里标注 (如 Grep 改为进程内 `ignore`/`grep` 库)。
+//! 各工具的 `call` 已实现 (in-process: `ignore`/tree-sitter/LSP/受控 shell 等);
+//! 抬上限的方向 (§4) 在各工具 doc 里标注。
 #![allow(dead_code, unused_variables)]
 
 mod ast_edit;
