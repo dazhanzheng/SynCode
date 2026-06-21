@@ -42,13 +42,17 @@ impl Budget {
 }
 
 impl Default for Budget {
-    /// DeepSeek v4 (保守取 128K 窗)。soft = 128000-16000-13000 = 99000; hard = 79000。
+    /// DeepSeek v4 (1M 窗)。soft = 1_000_000 - 64_000 - 64_000 = 872_000; hard = 832_000。
+    /// 1M 窗下绝大多数会话压根撞不到阈值 → 一直停在 Baseline (cache-stable); 结构阶梯 / LLM 摘要是
+    /// **超长会话**的安全阀。`output_reserve` 给 completion(max_tokens) + 高强度 CoT 留足; `safety_buffer`
+    /// 覆盖 estimate 在大 log 上的绝对低估 (真正纠偏靠 server prompt_tokens 回环)。窗口尺寸可经
+    /// [`AgentLoop::with_budget`](crate::agent::AgentLoop::with_budget) 覆盖。
     fn default() -> Self {
         Self {
-            context_window: 128_000,
-            output_reserve: 16_000,
-            summary_reserve: 20_000,
-            safety_buffer: 13_000,
+            context_window: 1_000_000,
+            output_reserve: 64_000,
+            summary_reserve: 40_000,
+            safety_buffer: 64_000,
         }
     }
 }
@@ -339,8 +343,8 @@ mod tests {
     fn server_measured_overrides_low_estimate() {
         let log = big_log(1);
         let budget = Budget::default();
-        // estimate 很小 → 本会 Baseline; 但 server 说 prompt 已 110k (> soft 99k) → 强制爬阶梯。
-        let c = compact_for_send(&TrimPolicy::default(), &log, &budget, Some(110_000), Rung::Baseline);
+        // estimate 很小 → 本会 Baseline; 但 server 说 prompt 已 900k (> soft 872k) → 强制爬阶梯。
+        let c = compact_for_send(&TrimPolicy::default(), &log, &budget, Some(900_000), Rung::Baseline);
         assert_ne!(c.rung, Rung::Baseline, "server-measured pressure must trigger compaction");
     }
 
