@@ -859,6 +859,10 @@ impl AgentApp {
         let Some(line) = self.lines.get(ix) else {
             return div().into_any_element();
         };
+        // 工具调用 / 推理 / diff = 次要内容: 比正文 (user/assistant) **左右都更窄** (内缩),
+        // 看着像嵌套的工具调用, 右侧也不再贴着滚动条。正文则用窄内边距、占满阅读宽度。
+        let secondary =
+            matches!(line, Line::Tool { .. } | Line::Reasoning { .. } | Line::Diff { .. });
         let inner = match line {
             Line::Tool { name, args, result, ok, expanded } => self
                 .render_tool(ix, name, args, result.as_deref(), *ok, *expanded, cx)
@@ -872,7 +876,8 @@ impl AgentApp {
             Line::Assistant(text) => self.render_assistant(ix, text, cx).into_any_element(),
             other => self.render_line(other, cx).into_any_element(),
         };
-        div().px_1().pb_3().child(inner).into_any_element()
+        let wrap = if secondary { div().px_6() } else { div().px_1() };
+        wrap.pb_3().child(inner).into_any_element()
     }
 }
 
