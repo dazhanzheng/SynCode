@@ -35,7 +35,7 @@ impl DeepSeekConfig {
         let api_key = std::env::var("DEEPSEEK_API_KEY").map_err(|_| Error::Api {
             status: 401,
             code: Some("missing_api_key".to_string()),
-            message: "DEEPSEEK_API_KEY 环境变量未设置".to_string(),
+            message: "DEEPSEEK_API_KEY environment variable is not set".to_string(),
             retry_after_secs: None,
         })?;
         Ok(Self::new(api_key))
