@@ -876,7 +876,9 @@ impl AgentApp {
             Line::Assistant(text) => self.render_assistant(ix, text, cx).into_any_element(),
             other => self.render_line(other, cx).into_any_element(),
         };
-        let wrap = if secondary { div().px_6() } else { div().px_1() };
+        // 工具类: 强制撑满列表宽 (w_full) 再 px_6 左右内缩 —— 否则 div 按内容自适应宽, padding 推不动右边界。
+        // 正文: 保持内容自适应宽 (右侧自然留富余), 只给一点点内边距。
+        let wrap = if secondary { div().w_full().px_6() } else { div().px_1() };
         wrap.pb_3().child(inner).into_any_element()
     }
 }
