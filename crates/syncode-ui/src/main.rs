@@ -23,6 +23,31 @@ use syncode_core::{AgentEvent, AgentLoop, AskGate, EventSink, FsScope, Session, 
 use syncode_llm::{DeepSeekClient, DeepSeekConfig};
 use syncode_tools::register_builtins;
 
+// ═══════════════════════════════════════════════
+//  Color palette — cohesive dark-theme accents
+// ═══════════════════════════════════════════════
+mod color {
+    use gpui::*;
+    /// Teal — assistant / tool-ok / brand accent
+    pub fn teal() -> Hsla { rgb(0x4ec9b0).into() }
+    /// Blue — diff hunk heads / interactive accent
+    pub fn blue() -> Hsla { rgb(0x58a6ff).into() }
+    /// Green — success / running / diff-add
+    pub fn green() -> Hsla { rgb(0x3fb950).into() }
+    /// Red — danger / error / diff-del
+    pub fn red() -> Hsla { rgb(0xf85149).into() }
+    /// Amber — warning / approval / reasoning
+    pub fn amber() -> Hsla { rgb(0xd29922).into() }
+    /// Card background for user messages (subtle blue tint)
+    pub fn user_card() -> Hsla { rgba(0x6675ff18).into() }
+    /// Card border for user messages
+    pub fn user_border() -> Hsla { rgba(0x6675ff30).into() }
+    /// Subtle surface for expanded tool / reasoning / diff cards
+    pub fn surface() -> Hsla { rgba(0x8a8a8a12).into() }
+    /// Approval card background
+    pub fn danger_bg() -> Hsla { rgba(0xf8514912).into() }
+}
+
 /// 只读演示任务: 用 Read 看一个文件并总结 —— 流式好看、且不改任何东西。
 const DEMO_TASK: &str = "Read the file crates/syncode-core/src/tool.rs and briefly summarize what \
     the `Tool` trait requires implementors to provide. Be concise.";
@@ -342,10 +367,9 @@ impl AgentApp {
     /// Tool/Reasoning/Diff 有各自的可折叠渲染, 这里的分支仅作 `match` 兜底。
     fn render_line(&self, line: &Line, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let assistant_tag: Hsla = rgb(0x4ec9b0).into(); // teal
         match line {
-            Line::User(t) => self.msg_block("YOU", theme.primary, t, true, cx),
-            Line::Assistant(t) => self.msg_block("SYNCODE", assistant_tag, t, false, cx),
+            Line::User(t) => self.msg_block("YOU", color::blue(), t, true, cx),
+            Line::Assistant(t) => self.msg_block("SYNCODE", color::teal(), t, false, cx),
             // 状态行: 居中、暗、小 —— 当分隔提示用。
             Line::Status(t) => h_flex()
                 .w_full()
@@ -355,16 +379,16 @@ impl AgentApp {
                 .into_any_element(),
             Line::Tool { name, ok, result, .. } => self.msg_block(
                 if *ok { "TOOL" } else { "TOOL!" },
-                theme.muted_foreground,
+                if *ok { color::teal() } else { color::red() },
                 &format!("{name}  {}", result.as_deref().unwrap_or("…")),
                 false,
                 cx,
             ),
             Line::Reasoning { text, .. } => {
-                self.msg_block("THINK", theme.muted_foreground, &truncate(text, 120), false, cx)
+                self.msg_block("THINK", color::amber(), &truncate(text, 120), false, cx)
             }
             Line::Diff { path, .. } => {
-                self.msg_block("DIFF", theme.muted_foreground, path, false, cx)
+                self.msg_block("DIFF", color::blue(), path, false, cx)
             }
         }
     }
@@ -380,16 +404,22 @@ impl AgentApp {
     ) -> AnyElement {
         let theme = cx.theme();
         let mut block = v_flex()
-            .gap_1()
-            .child(div().text_xs().font_bold().text_color(tag_color).child(tag.to_string()))
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_bold()
+                    .text_color(tag_color)
+                    .child(tag.to_string()),
+            )
             .child(div().text_sm().text_color(theme.foreground).child(body.to_string()));
         if carded {
             block = block
                 .p_3()
                 .rounded(px(10.))
-                .bg(rgba(0x6675ff14))
+                .bg(color::user_card())
                 .border_1()
-                .border_color(rgba(0x6675ff2b));
+                .border_color(color::user_border());
         }
         block.into_any_element()
     }
@@ -398,14 +428,20 @@ impl AgentApp {
     /// 用 gpui-component 的 `TextView::markdown` (内建解析 + 高亮)。id 用行下标保持稳定。
     fn render_assistant(&self, i: usize, text: &str, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let tag: Hsla = rgb(0x4ec9b0).into();
         v_flex()
-            .gap_1()
+            .gap_2()
             .child(
                 h_flex()
                     .justify_between()
                     .items_center()
-                    .child(div().text_xs().font_bold().text_color(tag).child("SYNCODE"))
+                    .child(
+                        div()
+                            .text_xs()
+                            
+                            .font_bold()
+                            .text_color(color::teal())
+                            .child("SYNCODE"),
+                    )
                     .child(copy_button(("copy-md", i), text.to_string(), cx)),
             )
             .child(
@@ -433,7 +469,7 @@ impl AgentApp {
         let glyph = if expanded { "▾" } else { "▸" };
         // 左侧可点击区 = 折叠开关; 右侧独立的 Copy 按钮 = 把本块完整内容写进剪贴板 (两动作分离, 不打架)。
         h_flex()
-            .gap_1()
+            .gap_2()
             .items_center()
             .child(
                 h_flex()
@@ -445,9 +481,25 @@ impl AgentApp {
                     .py_1()
                     .rounded(px(6.))
                     .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0xffffff0a)))
                     .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_expanded(i, cx)))
-                    .child(div().w(px(12.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(glyph))
-                    .child(div().flex_shrink_0().text_xs().font_bold().text_color(tag_color).child(tag.to_string()))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(glyph),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            
+                            .font_bold()
+                            .text_color(tag_color)
+                            .child(tag.to_string()),
+                    )
                     .child(div().flex_1().text_sm().text_color(summary_color).child(summary)),
             )
             .child(copy_button(("copy-block", i), copy_text, cx))
@@ -466,8 +518,9 @@ impl AgentApp {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let tag_color: Hsla = if ok { rgb(0x4ec9b0).into() } else { theme.danger };
-        let label = if ok { "TOOL" } else { "TOOL!" };
+        // tag = 工具真名 (Read/Write/Edit/Glob/Grep/AstGrep/AstEdit/Lsp/Bash/BashOutput), 不再套 "TOOL"。
+        // ok=teal, error=red 表状态。
+        let tag_color: Hsla = if ok { color::teal() } else { color::red() };
         let summary = match result {
             Some(r) => truncate(r, 120),
             None => "running…".to_string(),
@@ -481,9 +534,9 @@ impl AgentApp {
             "tool",
             i,
             expanded,
-            label,
+            name,
             tag_color,
-            format!("{name}  {summary}"),
+            summary,
             theme.muted_foreground,
             copy_text,
             cx,
@@ -500,12 +553,33 @@ impl AgentApp {
                 .gap_2()
                 .p_3()
                 .rounded(px(8.))
-                .bg(rgba(0x8a8a8a14))
+                .bg(color::surface())
+                .border_1()
+                .border_color(theme.border)
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_xs()
-                .child(div().text_color(theme.muted_foreground).child(format!("args  {args}")));
+                .child(
+                    div()
+                        .text_xs()
+                        .font_bold()
+                        .text_color(theme.muted_foreground)
+                        .child("ARGS"),
+                )
+                .child(div().text_color(theme.muted_foreground).child(args.to_string()));
             if let Some(r) = result {
-                card = card.child(div().text_color(theme.foreground).child(r.to_string()));
+                card = card
+                    .child(
+                        div().w_full().h(px(1.)).bg(theme.border),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            
+                            .font_bold()
+                            .text_color(theme.muted_foreground)
+                            .child("RESULT"),
+                    )
+                    .child(div().text_color(theme.foreground).child(r.to_string()));
             }
             col = col.child(card);
         }
@@ -528,7 +602,7 @@ impl AgentApp {
             i,
             expanded,
             "THINK",
-            theme.muted_foreground,
+            color::amber(),
             summary,
             theme.muted_foreground,
             text.to_string(),
@@ -545,7 +619,9 @@ impl AgentApp {
                     .ml(px(20.))
                     .p_3()
                     .rounded(px(8.))
-                    .bg(rgba(0x8a8a8a14))
+                    .bg(color::surface())
+                    .border_1()
+                    .border_color(theme.border)
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(text.to_string()),
@@ -573,7 +649,7 @@ impl AgentApp {
             i,
             expanded,
             "DIFF",
-            rgb(0x58a6ff).into(),
+            color::blue(),
             format!("{path}   +{adds} -{dels}"),
             theme.foreground,
             text.to_string(),
@@ -588,11 +664,11 @@ impl AgentApp {
                     let color: Hsla = if l.starts_with("+++") || l.starts_with("---") {
                         theme.muted_foreground
                     } else if l.starts_with('@') {
-                        rgb(0x58a6ff).into() // hunk 头
+                        color::blue() // hunk 头
                     } else if l.starts_with('+') {
-                        rgb(0x3fb950).into() // 增
+                        color::green() // 增
                     } else if l.starts_with('-') {
-                        rgb(0xf85149).into() // 删
+                        color::red() // 删
                     } else {
                         theme.muted_foreground // 上下文
                     };
@@ -607,7 +683,9 @@ impl AgentApp {
                     .ml(px(20.))
                     .p_3()
                     .rounded(px(8.))
-                    .bg(rgba(0x0d11171f))
+                    .bg(color::surface())
+                    .border_1()
+                    .border_color(theme.border)
                     .font_family(cx.theme().mono_font_family.clone())
                     .children(rows),
             );
@@ -625,12 +703,12 @@ impl Render for AgentApp {
         v_flex().size_full().bg(theme.background).items_center().child(
             v_flex()
                 .size_full()
-                .max_w(px(880.))
+                .max_w(px(900.))
                 .px_6()
-                .py_5()
-                .gap_4()
+                .py_4()
+                .gap_3()
                 .child(self.render_header(running, cx))
-                // transcript = 变高虚拟列表 (list, 只渲可见行 → 内容多也不卡) + 右侧 16px 滚动条槽。
+                // transcript = 变高虚拟列表 (list, 只渲可见行 → 内容多也不卡) + 右侧 12px 滚动条槽。
                 // 外层 flex_1+min_h(0) 给定有界视口高; list 自己处理滚动/滚轮/贴底; 滚动条读 list_state。
                 .child(
                     div()
@@ -650,7 +728,7 @@ impl Render for AgentApp {
                             div()
                                 .relative()
                                 .flex_shrink_0()
-                                .w(px(16.))
+                                .w(px(12.))
                                 .h_full()
                                 .child(
                                     Scrollbar::vertical(&self.list_state)
@@ -694,60 +772,110 @@ impl AgentApp {
     /// 顶栏: 标题 + 副标题 / 状态点 + New chat。底部细分隔线。
     fn render_header(&self, running: bool, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let dot: Hsla = if running { rgb(0x3fb950).into() } else { theme.muted_foreground };
+        let dot: Hsla = if running { color::green() } else { theme.muted_foreground };
         let status = if running { "running" } else { "idle" };
-        h_flex()
-            .justify_between()
-            .items_center()
+        v_flex()
             .pb_3()
+            .gap_2()
             .border_b_1()
             .border_color(theme.border)
             .child(
-                v_flex()
-                    .child(div().text_lg().font_bold().text_color(theme.foreground).child("SynCode"))
-                    // 副标题 = 当前 workspace 路径 (尾部优先, 太长则前缀省略)。
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("📁 {}", short_path(&self.workspace))),
-                    ),
-            )
-            .child(
                 h_flex()
-                    .gap_2()
+                    .justify_between()
                     .items_center()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                div()
+                                    .size(px(28.))
+                                    .rounded(px(8.))
+                                    .bg(color::teal())
+                                    .flex_shrink_0()
+                                    .child(
+                                        div()
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_sm()
+                                            .text_color(rgb(0x000000))
+                                            .child("S"),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_bold()
+                                            .text_color(theme.foreground)
+                                            .child("SynCode"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!("📁 {}", short_path(&self.workspace))),
+                                    ),
+                            ),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .mr_1()
-                            .child(div().size(px(8.)).rounded_full().bg(dot))
-                            .child(div().text_xs().text_color(theme.muted_foreground).child(status)),
-                    )
-                    .child(
-                        Button::new("copy-log").ghost().label("Copy log").on_click(cx.listener(
-                            |this, _ev, _window, cx| {
-                                let text = this.transcript_text();
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            },
-                        )),
-                    )
-                    .child(
-                        Button::new("open-folder")
-                            .ghost()
-                            .label("Open folder…")
-                            .disabled(running)
-                            .on_click(
-                                cx.listener(|this, _ev, window, cx| this.open_workspace(window, cx)),
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(12.))
+                                    .bg(color::surface())
+                                    .mr_1()
+                                    .child(
+                                        div()
+                                            .size(px(7.))
+                                            .rounded_full()
+                                            .bg(dot)
+                                            .border_1()
+                                            .border_color(if running { color::green() } else { theme.border }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(status),
+                                    ),
+                            )
+                            .child(
+                                Button::new("copy-log")
+                                    .ghost()
+                                    .label("Copy log")
+                                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                                        let text = this.transcript_text();
+                                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                    })),
+                            )
+                            .child(
+                                Button::new("open-folder")
+                                    .ghost()
+                                    .label("Open folder…")
+                                    .disabled(running)
+                                    .on_click(cx.listener(|this, _ev, window, cx| {
+                                        this.open_workspace(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("new-chat")
+                                    .ghost()
+                                    .label("New chat")
+                                    .disabled(running)
+                                    .on_click(cx.listener(|this, _ev, window, cx| {
+                                        this.new_chat(window, cx)
+                                    })),
                             ),
-                    )
-                    .child(
-                        Button::new("new-chat")
-                            .ghost()
-                            .label("New chat")
-                            .disabled(running)
-                            .on_click(cx.listener(|this, _ev, window, cx| this.new_chat(window, cx))),
                     ),
             )
     }
@@ -764,35 +892,49 @@ impl AgentApp {
             .text_color(theme.muted_foreground)
             .child(
                 h_flex()
-                    .gap_3()
-                    .child(div().child(format!("↑ {} in", fmt_tokens(u.prompt))))
-                    .child(div().child(format!("↓ {} out", fmt_tokens(u.completion)))),
+                    .gap_2()
+                    .child(usage_pill("↑", &fmt_tokens(u.prompt), "in", color::teal(), theme))
+                    .child(usage_pill("↓", &fmt_tokens(u.completion), "out", color::blue(), theme)),
             )
             .child(
                 h_flex()
-                    .gap_3()
-                    .child(div().child(format!("⚡ {} cached", fmt_tokens(u.cache_hit))))
-                    .child(div().child(format!("⊙ {} think", fmt_tokens(u.reasoning))))
-                    .child(div().child(format!("Σ {} total", fmt_tokens(u.total)))),
+                    .gap_2()
+                    .child(usage_pill("⚡", &fmt_tokens(u.cache_hit), "cached", theme.muted_foreground, theme))
+                    .child(usage_pill("⊙", &fmt_tokens(u.reasoning), "think", color::amber(), theme))
+                    .child(usage_pill("Σ", &fmt_tokens(u.total), "total", theme.foreground, theme)),
             )
     }
 
     /// 底部输入行: 文本框 + Send, 顶部细分隔线。
     fn render_input(&self, running: bool, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        h_flex()
-            .gap_2()
-            .items_center()
+        v_flex()
             .pt_3()
+            .gap_2()
             .border_t_1()
             .border_color(theme.border)
-            .child(TextInput::new(&self.input).flex_1())
             .child(
-                Button::new("send")
-                    .primary()
-                    .label(if running { "…" } else { "Send" })
-                    .disabled(running)
-                    .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx))),
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .rounded(px(8.))
+                            .bg(color::surface())
+                            .border_1()
+                            .border_color(theme.border)
+                            .px_3()
+                            .py_2()
+                            .child(TextInput::new(&self.input)),
+                    )
+                    .child(
+                        Button::new("send")
+                            .primary()
+                            .label(if running { "…" } else { "Send ↗" })
+                            .disabled(running)
+                            .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx))),
+                    ),
             )
     }
 }
@@ -808,8 +950,8 @@ impl AgentApp {
             .gap_3()
             .p_4()
             .border_1()
-            .border_color(theme.danger)
-            .bg(rgba(0xf8514915))
+            .border_color(color::amber())
+            .bg(color::danger_bg())
             .rounded(px(10.))
             .child(
                 v_flex()
@@ -817,8 +959,9 @@ impl AgentApp {
                     .child(
                         div()
                             .text_xs()
+                            
                             .font_bold()
-                            .text_color(theme.danger)
+                            .text_color(color::amber())
                             .child(format!("⚠ APPROVAL NEEDED · {class}")),
                     )
                     .child(div().text_sm().text_color(theme.foreground).child(what)),
@@ -859,6 +1002,7 @@ fn truncate(s: &str, n: usize) -> String {
 /// 小号「Copy」按钮: 点击把 `text` 写进系统剪贴板。用可点击 div (比 Button 紧凑、好控样式)。
 /// 解决 gpui 里普通文本不可拖选的问题 —— 整段一键复制, 方便把工具输出/报错贴出去。
 fn copy_button(id: impl Into<ElementId>, text: String, cx: &Context<AgentApp>) -> impl IntoElement {
+    let theme = cx.theme();
     div()
         .id(id)
         .flex_shrink_0()
@@ -866,12 +1010,26 @@ fn copy_button(id: impl Into<ElementId>, text: String, cx: &Context<AgentApp>) -
         .py_1()
         .rounded(px(5.))
         .text_xs()
-        .text_color(cx.theme().muted_foreground)
+        .text_color(theme.muted_foreground)
         .cursor_pointer()
+        .hover(|s| s.bg(rgba(0xffffff0a)).text_color(theme.foreground))
         .child("Copy")
         .on_click(cx.listener(move |_this, _ev, _window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
         }))
+}
+
+/// token 用量小药丸: 符号 + 数值 + 标签, 用给定颜色。
+fn usage_pill(icon: &str, val: &str, label: &str, accent: Hsla, theme: &Theme) -> impl IntoElement {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .px_2()
+        .py_1()
+        .rounded(px(4.))
+        .child(div().text_color(accent).child(icon.to_string()))
+        .child(div().text_color(theme.foreground).child(val.to_string()))
+        .child(div().text_color(theme.muted_foreground).child(label.to_string()))
 }
 
 /// token 数人读化: <1k 原样, <1M → x.xk, 否则 x.xxM。
