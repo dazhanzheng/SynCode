@@ -250,10 +250,159 @@ pub mod windows_backend {
     }
 }
 
-// 平台后端 (TODO): 各写一个, 或砍成 Linux-only (见 §5.1 可移植税)。
+// 平台后端: Linux landlock(FS) + seccomp(网络) 已实现 (见下); macOS 待 (见末尾)。
 #[cfg(target_os = "linux")]
 pub mod linux {
-    //! landlock + seccompiler + namespaces 后端 (TODO, §4/§7)。
+    //! Linux 深度沙箱后端 (§4/§7, 支柱 4 = 解锁支柱 2 的前提): landlock LSM 做**文件能力收容**
+    //! (让 `Policy.read_roots/write_roots` 首次真正 load-bearing), seccomp-BPF 做**网络拒绝**
+    //! (让 `allow_network=false` 在**内核层**生效, 而非靠 classifier)。内核 ≥5.13 (landlock) / ≥3.5
+    //! (seccomp), 均**无需 root**。
+    //!
+    //! ⚠️ **诚实约束 / 验证状态 (2026-06)**: 本后端**仅 cross-target 编译验证** (Windows 上
+    //! `cargo check --target x86_64-unknown-linux-gnu`), **从未在真 Linux 内核上跑过逃逸测试** ——
+    //! 内核是否真的挡住「写授权根外」「连任意网络」**尚未实证**。落到真 Linux/CI 前**不得**当作可信
+    //! 隔离, 故**不**默认接进 Bash 执行路径 (默认仍 [`NoopSandbox`]); 这里只把后端**写出来 + 编译住**,
+    //! 待 Linux CI 跑 [`escape_tests`] 文档化的两个逃逸用例 (写出根被拒 / curl 被拒, 均须在内核层失败)。
+    //!
+    //! **集成注意 (async-signal-safety)**: `PathFd::new` 会开 fd (分配, 非 async-signal-safe), 故
+    //! landlock 规则集应在 **fork 前**构建好; 真正的 `restrict_self` / `apply_filter` 在子进程
+    //! (post-fork, pre-exec) 调。当前 [`LinuxSandbox::apply`] 把两步合在一起 (供「在子进程里整体施加」
+    //! 的调用模型), 真机接入时需按此切分 —— 这正是必须在 Linux 上验证的点之一。
+
+    use super::{Policy, Sandbox, SandboxError};
+
+    /// landlock + seccomp 后端。`apply` 须在**目标进程自身** (理想是子进程 post-fork、pre-exec) 调用。
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct LinuxSandbox;
+
+    impl Sandbox for LinuxSandbox {
+        fn name(&self) -> &str {
+            "linux-landlock-seccomp"
+        }
+
+        /// 在当前进程上施加 policy: 先 landlock 文件收容, 再 (若禁网) seccomp 网络拒绝。
+        /// 顺序无强制依赖, 但 landlock 先行可在 seccomp 之前就锁死 FS。
+        fn apply(&self, policy: &Policy) -> Result<(), SandboxError> {
+            apply_landlock(policy)?;
+            if !policy.allow_network {
+                apply_seccomp_no_network()?;
+            }
+            Ok(())
+        }
+    }
+
+    fn map_ll(e: impl std::fmt::Display) -> SandboxError {
+        SandboxError::Apply(format!("landlock: {e}"))
+    }
+    fn map_sc(e: impl std::fmt::Display) -> SandboxError {
+        SandboxError::Apply(format!("seccomp: {e}"))
+    }
+
+    /// landlock 文件能力收容: 默认**无 FS 访问**, 仅显式放开 `read_roots` (只读) 与 `write_roots`
+    /// (读写)。`BestEffort` 兼容老内核 (不支持则尽力降级, 不硬失败)。`write_roots` 同时含读权 (写需读)。
+    fn apply_landlock(policy: &Policy) -> Result<(), SandboxError> {
+        use landlock::{
+            Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+            RulesetCreatedAttr, ABI,
+        };
+
+        // ABI::V2 = 内核 5.13 的文件访问位集 (read/write/execute/remove/make 等)。
+        let abi = ABI::V2;
+        let access_read = AccessFs::from_read(abi);
+        let access_all = AccessFs::from_all(abi); // 读+写+创建+删除…
+
+        // 处理「所有文件访问位」(handle = 我们要管控的访问面), 然后逐根加规则放开。
+        let mut created = Ruleset::default()
+            .set_compatibility(CompatLevel::BestEffort)
+            .handle_access(access_all)
+            .map_err(map_ll)?
+            .create()
+            .map_err(map_ll)?;
+
+        for root in &policy.read_roots {
+            let fd = PathFd::new(root).map_err(map_ll)?;
+            created = created.add_rule(PathBeneath::new(fd, access_read)).map_err(map_ll)?;
+        }
+        for root in &policy.write_roots {
+            let fd = PathFd::new(root).map_err(map_ll)?;
+            created = created.add_rule(PathBeneath::new(fd, access_all)).map_err(map_ll)?;
+        }
+
+        created.restrict_self().map_err(map_ll)?;
+        Ok(())
+    }
+
+    /// seccomp-BPF 网络拒绝: 默认放行全部 syscall, 仅对 `socket(AF_INET|AF_INET6, …)` 返回 `EACCES`
+    /// (放过 `AF_UNIX`/`AF_NETLINK` 等本地族 —— 否则会误伤进程间通信)。挡住 IP socket 的创建 = 进程
+    /// 无法发起 TCP/UDP 网络连接。
+    fn apply_seccomp_no_network() -> Result<(), SandboxError> {
+        use seccompiler::{
+            apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+            SeccompCondition, SeccompFilter, SeccompRule,
+        };
+        use std::collections::BTreeMap;
+
+        // socket 的第 0 个参数 = domain (AF_INET=2, AF_INET6=10)。命中即拒。
+        let cond_inet = SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_INET as u64,
+        )
+        .map_err(map_sc)?;
+        let cond_inet6 = SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_INET6 as u64,
+        )
+        .map_err(map_sc)?;
+
+        let rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::from([(
+            libc::SYS_socket,
+            vec![
+                SeccompRule::new(vec![cond_inet]).map_err(map_sc)?,
+                SeccompRule::new(vec![cond_inet6]).map_err(map_sc)?,
+            ],
+        )]);
+
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,                       // 默认: 放行 (不在 rules 里的 syscall)
+            SeccompAction::Errno(libc::EACCES as u32),  // 命中: socket(AF_INET*) → EACCES
+            target_arch()?,
+        )
+        .map_err(map_sc)?;
+
+        let prog: BpfProgram = filter.try_into().map_err(map_sc)?;
+        apply_filter(&prog).map_err(map_sc)?;
+        Ok(())
+    }
+
+    fn target_arch() -> Result<seccompiler::TargetArch, SandboxError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Ok(seccompiler::TargetArch::x86_64)
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            Ok(seccompiler::TargetArch::aarch64)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Err(SandboxError::Apply("seccomp: unsupported target_arch".into()))
+        }
+    }
+
+    /// 文档化的逃逸测试契约 (真 Linux/CI 跑): 落地前必须人工/CI 验证, 因为本后端从未在内核上运行过。
+    ///
+    /// 1. **写收容**: policy.write_roots = [tmp_proj]; 子进程 `apply` 后, 写 `tmp_proj/ok.txt` 成功,
+    ///    写 `/tmp/escape.txt` (根外) 必须 `EACCES`/`EPERM` —— **内核层**失败, 非 classifier。
+    /// 2. **网络拒绝**: policy.allow_network = false; 子进程 `apply` 后, `socket(AF_INET, …)` 必须
+    ///    返回 `EACCES` (等价: `curl http://example.com` 失败), 而 `AF_UNIX` socket 仍可建。
+    ///
+    /// 这两个用例无法在非 Linux 跑, 也不应在单元测试里 `restrict_self` (会污染测试进程), 故仅文档化。
+    pub mod escape_tests {}
 }
 
 #[cfg(target_os = "macos")]
