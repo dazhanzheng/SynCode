@@ -632,34 +632,38 @@ impl Render for AgentApp {
                 .py_5()
                 .gap_4()
                 .child(self.render_header(running, cx))
-                // transcript (照 gpui-component Scrollable 的已验证结构):
-                //   relative+flex_1+**min_h_0** 槽 (给定有界视口高, 否则内容按自然高撑开 → 不溢出 → 滚轮
-                //   没东西可滚) → size_full flex-col 滚动区 (overflow_y_scroll) → 内容包成**单个 flex_1 子**。
-                //   滚动条放右侧 ~16px 窄条 sibling: thumb 只取自 ScrollHandle (视口高+内容高=真实状态) 故对应
-                //   正确; 窄条不盖内容区, 内容区滚轮也不被它 hitbox 拦。三处缺一: 要么滚不动、要么 thumb 错位。
+                // transcript: 并排两列 = [可滚动内容 flex_1] [滚动条专属槽 16px]。滚动条进自己的列,
+                // **不覆盖内容**。结构要点: 外层 flex_1+min_h(0) 给定有界视口高 (否则内容按自然高撑开 →
+                // 不溢出 → 滚不动); 内容区 flex_1 + overflow_y_scroll + 内容包成单个 flex_1 子; 滚动条槽
+                // relative 16px, Scrollbar (absolute 充满该槽) 只读 ScrollHandle 算 thumb, 故位置正确。
                 .child(
                     div()
-                        .relative()
                         .flex_1()
                         .min_h(px(0.))
                         .child(
-                            v_flex()
-                                .id("transcript")
-                                .size_full()
-                                .track_scroll(&self.scroll)
-                                .overflow_y_scroll()
-                                .child(v_flex().flex_1().gap_3().pr_4().children(rows)),
-                        )
-                        .child(
                             div()
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .bottom_0()
-                                .w(px(16.))
+                                .flex()
+                                .size_full()
                                 .child(
-                                    Scrollbar::vertical(&self.scroll)
-                                        .scrollbar_show(ScrollbarShow::Always),
+                                    v_flex()
+                                        .id("transcript")
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .h_full()
+                                        .track_scroll(&self.scroll)
+                                        .overflow_y_scroll()
+                                        .child(v_flex().flex_1().gap_3().pr_2().children(rows)),
+                                )
+                                .child(
+                                    div()
+                                        .relative()
+                                        .flex_shrink_0()
+                                        .w(px(16.))
+                                        .h_full()
+                                        .child(
+                                            Scrollbar::vertical(&self.scroll)
+                                                .scrollbar_show(ScrollbarShow::Always),
+                                        ),
                                 ),
                         ),
                 )
