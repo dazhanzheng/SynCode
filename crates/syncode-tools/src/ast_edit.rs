@@ -125,7 +125,7 @@ impl Tool for AstEditTool {
         } else {
             updated.clone()
         };
-        fsutil::write_atomic(&path, &to_write)
+        fsutil::write_contained(&ctx.fs, &path, &to_write)
             .map_err(|e| ToolError::Exec(format!("write failed for {file_path}: {e}")))?;
 
         let diff = fsutil::make_diff(file_path, &current, &updated);

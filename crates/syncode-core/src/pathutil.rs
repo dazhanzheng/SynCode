@@ -44,6 +44,36 @@ pub fn within_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|r| within(path, r))
 }
 
+/// 若 `path` 在 `root` 之内, 返回**相对于 root 的路径** (词法归一后按平台规则逐组件比对前缀,
+/// Windows 大小写不敏感)。`path == root` → `Some("")`。不在内 → `None`。
+/// 供 cap-std 写收容把模型给的绝对路径换成根相对路径喂给 `Dir` 句柄 (TOCTOU-proof)。
+pub fn strip_within(path: &Path, root: &Path) -> Option<PathBuf> {
+    let np = normalize(path);
+    let nr = normalize(root);
+    let mut p_iter = np.components();
+    for rc in nr.components() {
+        match p_iter.next() {
+            Some(pc) if comp_eq(pc, rc) => continue,
+            _ => return None,
+        }
+    }
+    Some(p_iter.collect())
+}
+
+/// 单个路径组件的平台规则相等 (Windows 大小写不敏感, Unix 敏感)。
+fn comp_eq(a: Component, b: Component) -> bool {
+    let sa = a.as_os_str().to_string_lossy();
+    let sb = b.as_os_str().to_string_lossy();
+    #[cfg(windows)]
+    {
+        sa.eq_ignore_ascii_case(&sb)
+    }
+    #[cfg(not(windows))]
+    {
+        sa == sb
+    }
+}
+
 /// 归一成可比较字符串。Windows: 剥 verbatim 前缀 + 小写 + 统一反斜杠; Unix: 原样。
 fn comparable(p: &Path) -> String {
     let s = p.to_string_lossy();
@@ -77,6 +107,24 @@ mod tests {
         assert!(!within(Path::new("/etc/passwd"), Path::new("/proj")));
         assert!(within(Path::new("/proj/a/../b"), Path::new("/proj"))); // 归一后仍在内
         assert!(!within(Path::new("/proj/../etc/x"), Path::new("/proj"))); // 穿越出根
+    }
+
+    #[test]
+    fn strip_within_returns_relative() {
+        assert_eq!(
+            strip_within(Path::new("/proj/src/main.rs"), Path::new("/proj")),
+            Some(PathBuf::from("src/main.rs"))
+        );
+        // 归一后仍在内 → 相对路径也归一。
+        assert_eq!(
+            strip_within(Path::new("/proj/a/../b.rs"), Path::new("/proj")),
+            Some(PathBuf::from("b.rs"))
+        );
+        // path == root → 空相对路径。
+        assert_eq!(strip_within(Path::new("/proj"), Path::new("/proj")), Some(PathBuf::new()));
+        // 根外 → None。
+        assert_eq!(strip_within(Path::new("/etc/passwd"), Path::new("/proj")), None);
+        assert_eq!(strip_within(Path::new("/proj/../etc/x"), Path::new("/proj")), None);
     }
 
     #[cfg(windows)]

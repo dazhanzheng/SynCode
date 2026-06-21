@@ -13,5 +13,6 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 tokio = { workspace = true }
+cap-std = "3"
 syncode-llm = { workspace = true }
 syncode-lsp = { workspace = true }

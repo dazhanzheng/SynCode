@@ -77,7 +77,7 @@ impl Tool for WriteTool {
             String::new()
         };
         let normalized = content.replace("\r\n", "\n"); // Write 全量替换, 输出统一 LF。
-        fsutil::write_atomic(&path, &normalized)
+        fsutil::write_contained(&ctx.fs, &path, &normalized)
             .map_err(|e| ToolError::Exec(format!("write failed for {file_path}: {e}")))?;
 
         let diff = fsutil::make_diff(file_path, &old, &normalized);

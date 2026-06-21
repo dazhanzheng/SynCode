@@ -109,7 +109,7 @@ impl Tool for EditTool {
         } else {
             updated.clone()
         };
-        fsutil::write_atomic(&path, &to_write)
+        fsutil::write_contained(&ctx.fs, &path, &to_write)
             .map_err(|e| ToolError::Exec(format!("write failed for {file_path}: {e}")))?;
 
         let mtime = fsutil::mtime_ms(&path).unwrap_or(0);

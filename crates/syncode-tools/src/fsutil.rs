@@ -5,6 +5,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 use syncode_core::file_state::FileStateCache;
+use syncode_core::fs_scope::SharedFsScope;
 use syncode_core::tool::FileDiff;
 
 /// 算一次改动的 unified diff (供 UI diff 视图)。`old`/`new` 应是 LF 归一文本。无变化 → `None`。
@@ -77,6 +78,15 @@ pub fn file_is_crlf(path: &Path) -> bool {
 pub fn mtime_ms(path: &Path) -> std::io::Result<i64> {
     let mt = fs::metadata(path)?.modified()?;
     Ok(mt.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64)
+}
+
+/// 收容式写: 挂了写收容 (`FsScope`) → 走 cap-std `Dir` 句柄的**构造级**原子写 (TOCTOU-proof,
+/// 物理上逃不出授权根); 没挂 → 退回裸 [`write_atomic`] (测试 / standalone)。写类工具统一走这个。
+pub fn write_contained(fs: &SharedFsScope, path: &Path, content: &str) -> std::io::Result<()> {
+    match fs {
+        Some(scope) => scope.write_atomic(path, content.as_bytes()),
+        None => write_atomic(path, content),
+    }
 }
 
 /// 原子写: 同目录临时文件 + fsync + rename (写一半崩了也不会留半截文件)。
