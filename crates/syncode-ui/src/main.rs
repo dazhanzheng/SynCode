@@ -97,7 +97,9 @@ struct AgentApp {
     /// 在途审批请求 (Some 时渲染审批卡片, 阻塞 agent 直到人点 Allow/Deny)。
     pending_approval: Option<ApprovalRequest>,
     running: bool,
-    scroll: ScrollHandle,
+    /// 变高虚拟列表状态 (只渲可见行, 内容多也不卡)。Bottom 对齐 = 聊天式贴底。
+    /// 也直接当滚动条的 ScrollbarHandle 用 (位置/尺寸精确对应)。
+    list_state: ListState,
     _drain: Task<()>,
     _appr_drain: Task<()>,
 }
@@ -148,8 +150,11 @@ impl AgentApp {
                 }
             }
         });
+        let lines = vec![Line::Status("Ready — edit the task and press Enter (or Send).".into())];
         Self {
-            lines: vec![Line::Status("Ready — edit the task and press Enter (or Send).".into())],
+            // ListState 项数必须与 lines 同步 (初始 1 行)。Bottom 对齐 → 新内容贴底。
+            list_state: ListState::new(lines.len(), ListAlignment::Bottom, px(800.)),
+            lines,
             input,
             task_tx,
             // 初始 workspace = 进程 cwd, 与 worker 启动时取的根一致。
@@ -157,10 +162,22 @@ impl AgentApp {
             usage: UsageTotals::default(),
             pending_approval: None,
             running: false,
-            scroll: ScrollHandle::new(),
             _drain: drain,
             _appr_drain: appr_drain,
         }
+    }
+
+    /// 追加一行, 并同步 ListState (项数 +1)。
+    fn push_line(&mut self, line: Line) {
+        let n = self.lines.len();
+        self.lines.push(line);
+        self.list_state.splice(n..n, 1);
+    }
+
+    /// 重置 transcript 为给定行 (New chat / 切 workspace), 同步 ListState。
+    fn reset_lines(&mut self, lines: Vec<Line>) {
+        self.list_state.reset(lines.len());
+        self.lines = lines;
     }
 
     /// 人对在途审批请求作答: 把决定回送给 worker (解阻塞 agent), 清掉卡片。
@@ -172,31 +189,29 @@ impl AgentApp {
     }
 
     fn apply(&mut self, event: AgentEvent) {
-        // 黏底: 加内容前判断用户是否在底部附近 (基于上一帧)。在底 → 继续跟随最新; 已上滚 →
-        // 不再强拉回底, 这样长结果展开后能从容滚到顶部点收起 (修复「滚不回收起处」)。
-        let stick = self.near_bottom();
         match event {
-            AgentEvent::AssistantText(t) => self.lines.push(Line::Assistant(t)),
+            AgentEvent::AssistantText(t) => self.push_line(Line::Assistant(t)),
             AgentEvent::Reasoning { text } => {
-                self.lines.push(Line::Reasoning { text, expanded: false })
+                self.push_line(Line::Reasoning { text, expanded: false })
             }
             AgentEvent::FileChanged { path, diff } => {
                 // diff 是本功能的主角, 默认展开。
-                self.lines.push(Line::Diff { path, text: diff, expanded: true })
+                self.push_line(Line::Diff { path, text: diff, expanded: true })
             }
             AgentEvent::ToolStarted { name, args } => {
-                self.lines.push(Line::Tool { name, args, result: None, ok: true, expanded: false })
+                self.push_line(Line::Tool { name, args, result: None, ok: true, expanded: false })
             }
             AgentEvent::ToolFinished { result, is_error, .. } => {
-                // dispatch 串行 (Started→Finished 严格配对): 回填最近一个未完成的 Tool 行。
-                if let Some(Line::Tool { result: slot, ok, .. }) = self
-                    .lines
-                    .iter_mut()
-                    .rev()
-                    .find(|l| matches!(l, Line::Tool { result: None, .. }))
+                // dispatch 串行 (Started→Finished 严格配对): 回填最近一个未完成的 Tool 行;
+                // 高度变了 → 只重测该项 (虚拟列表需要)。
+                if let Some(idx) =
+                    self.lines.iter().rposition(|l| matches!(l, Line::Tool { result: None, .. }))
                 {
-                    *slot = Some(result);
-                    *ok = !is_error;
+                    if let Line::Tool { result: slot, ok, .. } = &mut self.lines[idx] {
+                        *slot = Some(result);
+                        *ok = !is_error;
+                    }
+                    self.list_state.remeasure_items(idx..idx + 1);
                 }
             }
             AgentEvent::Usage {
@@ -214,19 +229,10 @@ impl AgentApp {
                 self.usage.reasoning += reasoning_tokens;
             }
             AgentEvent::TurnDone => {
-                self.lines.push(Line::Status("— done —".into()));
+                self.push_line(Line::Status("— done —".into()));
                 self.running = false;
             }
         }
-        if stick {
-            self.scroll.scroll_to_bottom();
-        }
-    }
-
-    /// 当前滚动位置是否在底部附近 (距底 < 48px)。`offset().y` 向下为负, `max_offset().y` 为最大下滚
-    /// 距离, 故「距底 = max_offset.y + offset.y」, 触底时 ≈ 0。内容未溢出时两者皆 0 → 视为在底。
-    fn near_bottom(&self) -> bool {
-        (self.scroll.max_offset().y + self.scroll.offset().y) < px(48.)
     }
 
     /// 把整个 transcript 序列化成纯文本 (供「Copy log」一键复制, 方便整段贴出去)。
@@ -262,7 +268,7 @@ impl AgentApp {
         if task.is_empty() {
             return;
         }
-        self.lines.push(Line::User(task.clone()));
+        self.push_line(Line::User(task.clone()));
         self.running = true;
         let _ = self.task_tx.try_send(WorkerMsg::Task(task));
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -276,7 +282,7 @@ impl AgentApp {
             return;
         }
         let _ = self.task_tx.try_send(WorkerMsg::Reset);
-        self.lines = vec![Line::Status("New chat — context cleared.".into())];
+        self.reset_lines(vec![Line::Status("New chat — context cleared.".into())]);
         self.usage = UsageTotals::default();
         cx.notify();
     }
@@ -305,8 +311,10 @@ impl AgentApp {
     /// 切 workspace: 通知 worker 重建 agent (新根 = cwd / 审批写根 / FsScope), 清空 transcript 开新会话。
     fn set_workspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let _ = self.task_tx.try_send(WorkerMsg::SetWorkspace(path.clone()));
-        self.lines =
-            vec![Line::Status(format!("Workspace → {} · context cleared.", path.display()))];
+        self.reset_lines(vec![Line::Status(format!(
+            "Workspace → {} · context cleared.",
+            path.display()
+        ))]);
         self.workspace = path;
         self.usage = UsageTotals::default();
         cx.notify();
@@ -465,6 +473,7 @@ impl AgentApp {
             move |this, cx| {
                 if let Some(Line::Tool { expanded, .. }) = this.lines.get_mut(i) {
                     *expanded = !*expanded;
+                    this.list_state.remeasure_items(i..i + 1);
                     cx.notify();
                 }
             },
@@ -513,6 +522,7 @@ impl AgentApp {
             move |this, cx| {
                 if let Some(Line::Reasoning { expanded, .. }) = this.lines.get_mut(i) {
                     *expanded = !*expanded;
+                    this.list_state.remeasure_items(i..i + 1);
                     cx.notify();
                 }
             },
@@ -561,6 +571,7 @@ impl AgentApp {
             move |this, cx| {
                 if let Some(Line::Diff { expanded, .. }) = this.lines.get_mut(i) {
                     *expanded = !*expanded;
+                    this.list_state.remeasure_items(i..i + 1);
                     cx.notify();
                 }
             },
@@ -603,25 +614,6 @@ impl Render for AgentApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let running = self.running;
-        // Tool 行走可折叠的 render_tool (需下标做点击 id/toggle); 其余走 render_line。
-        let rows: Vec<AnyElement> = self
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| match l {
-                Line::Tool { name, args, result, ok, expanded } => self
-                    .render_tool(i, name, args, result.as_deref(), *ok, *expanded, cx)
-                    .into_any_element(),
-                Line::Reasoning { text, expanded } => {
-                    self.render_reasoning(i, text, *expanded, cx).into_any_element()
-                }
-                Line::Diff { path, text, expanded } => {
-                    self.render_diff(i, path, text, *expanded, cx).into_any_element()
-                }
-                Line::Assistant(text) => self.render_assistant(i, text, cx).into_any_element(),
-                other => self.render_line(other, cx).into_any_element(),
-            })
-            .collect();
 
         // 全屏背景, 内容居中收进一个最大宽度的阅读列 (宽窗也不至于撑满、留出舒适留白)。
         v_flex().size_full().bg(theme.background).items_center().child(
@@ -632,38 +624,31 @@ impl Render for AgentApp {
                 .py_5()
                 .gap_4()
                 .child(self.render_header(running, cx))
-                // transcript: 并排两列 = [可滚动内容 flex_1] [滚动条专属槽 16px]。滚动条进自己的列,
-                // **不覆盖内容**。结构要点: 外层 flex_1+min_h(0) 给定有界视口高 (否则内容按自然高撑开 →
-                // 不溢出 → 滚不动); 内容区 flex_1 + overflow_y_scroll + 内容包成单个 flex_1 子; 滚动条槽
-                // relative 16px, Scrollbar (absolute 充满该槽) 只读 ScrollHandle 算 thumb, 故位置正确。
+                // transcript = 变高虚拟列表 (list, 只渲可见行 → 内容多也不卡) + 右侧 16px 滚动条槽。
+                // 外层 flex_1+min_h(0) 给定有界视口高; list 自己处理滚动/滚轮/贴底; 滚动条读 list_state。
                 .child(
                     div()
                         .flex_1()
                         .min_h(px(0.))
+                        .flex()
+                        .child(
+                            list(
+                                self.list_state.clone(),
+                                cx.processor(|this, ix, window, cx| {
+                                    this.render_entry(ix, window, cx)
+                                }),
+                            )
+                            .flex_1(),
+                        )
                         .child(
                             div()
-                                .flex()
-                                .size_full()
+                                .relative()
+                                .flex_shrink_0()
+                                .w(px(16.))
+                                .h_full()
                                 .child(
-                                    v_flex()
-                                        .id("transcript")
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .h_full()
-                                        .track_scroll(&self.scroll)
-                                        .overflow_y_scroll()
-                                        .child(v_flex().flex_1().gap_3().pr_2().children(rows)),
-                                )
-                                .child(
-                                    div()
-                                        .relative()
-                                        .flex_shrink_0()
-                                        .w(px(16.))
-                                        .h_full()
-                                        .child(
-                                            Scrollbar::vertical(&self.scroll)
-                                                .scrollbar_show(ScrollbarShow::Always),
-                                        ),
+                                    Scrollbar::vertical(&self.list_state)
+                                        .scrollbar_show(ScrollbarShow::Always),
                                 ),
                         ),
                 )
@@ -672,6 +657,30 @@ impl Render for AgentApp {
                 .child(self.render_usage(cx))
                 .child(self.render_input(running, cx)),
         )
+    }
+}
+
+impl AgentApp {
+    /// 渲染第 `ix` 行 (供虚拟 `list` 按需调用; 经 `cx.processor` 拿到 `&mut Self` + `Context<Self>`,
+    /// 故点击/折叠的 `cx.listener` 照用)。每项底部留间距代替原来的 gap。
+    fn render_entry(&mut self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(line) = self.lines.get(ix) else {
+            return div().into_any_element();
+        };
+        let inner = match line {
+            Line::Tool { name, args, result, ok, expanded } => self
+                .render_tool(ix, name, args, result.as_deref(), *ok, *expanded, cx)
+                .into_any_element(),
+            Line::Reasoning { text, expanded } => {
+                self.render_reasoning(ix, text, *expanded, cx).into_any_element()
+            }
+            Line::Diff { path, text, expanded } => {
+                self.render_diff(ix, path, text, *expanded, cx).into_any_element()
+            }
+            Line::Assistant(text) => self.render_assistant(ix, text, cx).into_any_element(),
+            other => self.render_line(other, cx).into_any_element(),
+        };
+        div().px_1().pb_3().child(inner).into_any_element()
     }
 }
 
