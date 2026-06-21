@@ -65,7 +65,9 @@ pub fn eval_suite(log: &[Message], policies: &[(String, TrimPolicy)]) -> Vec<Tri
     policies.iter().map(|(label, p)| eval_policy(label, log, p)).collect()
 }
 
-/// 一组标准候选策略 (现成可比): none / cot-only / stub / truncate-2k。
+/// 一组标准候选策略 (现成可比), 覆盖压缩阶梯的各结构档 (对应 core `compaction::Rung` 的纯-`TrimPolicy`
+/// 部分): none(baseline) / cot-only / reclaim-cot / truncate-2k(soft) / stub(stub) / ladder-max(stub+reclaim)。
+/// `DropOldest` / LLM 摘要不是纯 `TrimPolicy`, 故不在此离线 suite —— 由 core 的 compaction 测试覆盖。
 pub fn standard_suite() -> Vec<(String, TrimPolicy)> {
     vec![
         (
@@ -74,12 +76,24 @@ pub fn standard_suite() -> Vec<(String, TrimPolicy)> {
         ),
         ("cot-only".to_string(), TrimPolicy::default()),
         (
+            // = Rung::ReclaimCot: 删所有闭合轮 CoT。
+            "reclaim-cot".to_string(),
+            TrimPolicy { keep_recent_cot_rounds: 0, ..Default::default() },
+        ),
+        (
+            // = Rung::SoftTruncate.
+            "truncate-2k".to_string(),
+            TrimPolicy { max_tool_result_chars: Some(2000), ..Default::default() },
+        ),
+        (
+            // = Rung::StubResults.
             "stub-old-results".to_string(),
             TrimPolicy { stub_tool_results: true, ..Default::default() },
         ),
         (
-            "truncate-2k".to_string(),
-            TrimPolicy { max_tool_result_chars: Some(2000), ..Default::default() },
+            // = Rung::StubResults 叠加 reclaim-cot (结构阶梯里最激进的纯-TrimPolicy 档)。
+            "ladder-max".to_string(),
+            TrimPolicy { keep_recent_cot_rounds: 0, stub_tool_results: true, ..Default::default() },
         ),
     ]
 }
