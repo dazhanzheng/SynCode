@@ -193,6 +193,31 @@ impl AgentApp {
         (self.scroll.max_offset().y + self.scroll.offset().y) < px(48.)
     }
 
+    /// 把整个 transcript 序列化成纯文本 (供「Copy log」一键复制, 方便整段贴出去)。
+    fn transcript_text(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            match line {
+                Line::User(t) => out.push_str(&format!("## you\n{t}\n\n")),
+                Line::Assistant(t) => out.push_str(&format!("## syncode\n{t}\n\n")),
+                Line::Tool { name, args, result, ok, .. } => {
+                    out.push_str(&format!("## tool: {name}{}\n", if *ok { "" } else { " (error)" }));
+                    out.push_str(&format!("args: {args}\n"));
+                    if let Some(r) = result {
+                        out.push_str(&format!("result:\n{r}\n"));
+                    }
+                    out.push('\n');
+                }
+                Line::Reasoning { text, .. } => out.push_str(&format!("## reasoning\n{text}\n\n")),
+                Line::Diff { path, text, .. } => {
+                    out.push_str(&format!("## diff: {path}\n{text}\n\n"))
+                }
+                Line::Status(t) => out.push_str(&format!("· {t}\n\n")),
+            }
+        }
+        out
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.running {
             return;
@@ -312,7 +337,13 @@ impl AgentApp {
         let tag: Hsla = rgb(0x4ec9b0).into();
         v_flex()
             .gap_1()
-            .child(div().text_xs().font_bold().text_color(tag).child("SYNCODE"))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_xs().font_bold().text_color(tag).child("SYNCODE"))
+                    .child(copy_button(("copy-md", i), text.to_string(), cx)),
+            )
             .child(
                 div()
                     .text_sm()
@@ -324,29 +355,39 @@ impl AgentApp {
     /// 可折叠区块共用的 header: 可点击 (chevron + 角色 tag + 摘要), 圆角内边距, 翻转 `expanded`。
     fn collapsible_header(
         &self,
-        id: impl Into<ElementId>,
+        kind: &'static str,
+        i: usize,
         expanded: bool,
         tag: &str,
         tag_color: Hsla,
         summary: String,
         summary_color: Hsla,
+        copy_text: String,
         cx: &Context<Self>,
         toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         let theme = cx.theme();
         let glyph = if expanded { "▾" } else { "▸" };
+        // 左侧可点击区 = 折叠开关; 右侧独立的 Copy 按钮 = 把本块完整内容写进剪贴板 (两动作分离, 不打架)。
         h_flex()
-            .id(id)
-            .gap_2()
+            .gap_1()
             .items_center()
-            .px_2()
-            .py_1()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _ev, _window, cx| toggle(this, cx)))
-            .child(div().w(px(12.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(glyph))
-            .child(div().flex_shrink_0().text_xs().font_bold().text_color(tag_color).child(tag.to_string()))
-            .child(div().flex_1().text_sm().text_color(summary_color).child(summary))
+            .child(
+                h_flex()
+                    .id((kind, i))
+                    .flex_1()
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _ev, _window, cx| toggle(this, cx)))
+                    .child(div().w(px(12.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(glyph))
+                    .child(div().flex_shrink_0().text_xs().font_bold().text_color(tag_color).child(tag.to_string()))
+                    .child(div().flex_1().text_sm().text_color(summary_color).child(summary)),
+            )
+            .child(copy_button(("copy-block", i), copy_text, cx))
     }
 
     /// 可折叠工具行: 可点击 header (▸/▾ + name + 结果摘要); 展开时在下方显示完整 args + result。
@@ -369,13 +410,19 @@ impl AgentApp {
             None => "running…".to_string(),
         };
 
+        let copy_text = match result {
+            Some(r) => format!("$ {name} {args}\n{r}"),
+            None => format!("$ {name} {args}"),
+        };
         let header = self.collapsible_header(
-            ("tool", i),
+            "tool",
+            i,
             expanded,
             label,
             tag_color,
             format!("{name}  {summary}"),
             theme.muted_foreground,
+            copy_text,
             cx,
             move |this, cx| {
                 if let Some(Line::Tool { expanded, .. }) = this.lines.get_mut(i) {
@@ -416,12 +463,14 @@ impl AgentApp {
         let summary = truncate(text, 120);
 
         let header = self.collapsible_header(
-            ("reasoning", i),
+            "reasoning",
+            i,
             expanded,
             "THINK",
             theme.muted_foreground,
             summary,
             theme.muted_foreground,
+            text.to_string(),
             cx,
             move |this, cx| {
                 if let Some(Line::Reasoning { expanded, .. }) = this.lines.get_mut(i) {
@@ -462,12 +511,14 @@ impl AgentApp {
         let dels = text.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
 
         let header = self.collapsible_header(
-            ("diff", i),
+            "diff",
+            i,
             expanded,
             "DIFF",
             rgb(0x58a6ff).into(),
             format!("{path}   +{adds} -{dels}"),
             theme.foreground,
+            text.to_string(),
             cx,
             move |this, cx| {
                 if let Some(Line::Diff { expanded, .. }) = this.lines.get_mut(i) {
@@ -609,6 +660,14 @@ impl AgentApp {
                             .child(div().text_xs().text_color(theme.muted_foreground).child(status)),
                     )
                     .child(
+                        Button::new("copy-log").ghost().label("Copy log").on_click(cx.listener(
+                            |this, _ev, _window, cx| {
+                                let text = this.transcript_text();
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            },
+                        )),
+                    )
+                    .child(
                         Button::new("open-folder")
                             .ghost()
                             .label("Open folder…")
@@ -704,6 +763,24 @@ fn truncate(s: &str, n: usize) -> String {
         let t: String = s.chars().take(n).collect();
         format!("{t}…")
     }
+}
+
+/// 小号「Copy」按钮: 点击把 `text` 写进系统剪贴板。用可点击 div (比 Button 紧凑、好控样式)。
+/// 解决 gpui 里普通文本不可拖选的问题 —— 整段一键复制, 方便把工具输出/报错贴出去。
+fn copy_button(id: impl Into<ElementId>, text: String, cx: &Context<AgentApp>) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .px_2()
+        .py_1()
+        .rounded(px(5.))
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .cursor_pointer()
+        .child("Copy")
+        .on_click(cx.listener(move |_this, _ev, _window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        }))
 }
 
 /// 路径短展示: 太长时保留**尾部** (更有信息量), 前面用 `…` 省略。
