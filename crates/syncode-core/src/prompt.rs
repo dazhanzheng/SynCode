@@ -54,6 +54,10 @@ bytes; AstEdit rewrites by structure and rejects edits that would not parse. Rea
 grepping for a symbol or hand-editing a structural change.\n\
 - Edit changes existing files; Write is for new files or full rewrites (Read first if it exists). Do \
 not create files — especially README/docs/markdown — unless they are needed for the task.\n\
+- For a batch of file operations that follow a simple pattern (e.g. the same edit across files you \
+already know), the Script tool runs one in-process script (read/write/edit/exists) in a single call \
+instead of many round-trips. Writes from it are still confined to the workspace. Use the plain tools \
+for single operations.\n\
 - Use absolute paths. The shell is stateless between Bash calls, so cd does not persist; pass full \
 paths.\n\
 - For long-running commands (servers, watchers) use Bash background mode and poll with BashOutput; \
