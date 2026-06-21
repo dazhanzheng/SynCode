@@ -35,11 +35,20 @@ enum WorkerMsg {
     SetWorkspace(PathBuf),
 }
 
-/// agent 的 system prompt: 含当前项目根, 让模型知道自己在哪个 workspace 工作。
+/// agent 的 system prompt: 含当前项目根 + **工具选用策略** (引导优先用 in-process 语义工具, 别动不动
+/// 退回 Bash)。工具的名字/描述/schema 已由 function-calling 自动发给模型, 故这里只给「何时用哪个」。
 fn system_prompt(root: &Path) -> String {
     format!(
-        "You are SynCode, an autonomous coding agent. The current project workspace is {}. Use \
-         absolute paths. Locate code with Grep/Read before answering. Be concise.",
+        "You are SynCode, an autonomous coding agent working in the project workspace at {}.\n\
+         Prefer the dedicated in-process tools over the shell:\n\
+         - Read to read a file; Grep for text search; AstGrep to search by code structure \
+         (syntax-aware, more precise than regex).\n\
+         - Lsp for code intelligence (document symbols, go-to-definition, references) — use it to \
+         locate definitions and implementors instead of grepping when you need symbols.\n\
+         - Edit for exact text edits; AstEdit for structural rewrites (re-parsed, syntax-guaranteed).\n\
+         - Use Bash only for builds, tests, git, running programs, and listing directories.\n\
+         Use absolute paths. Locate code with Grep/AstGrep/Lsp before editing; after editing, build \
+         with cargo via Bash and fix any errors. Be concise.",
         root.display()
     )
 }
