@@ -17,6 +17,9 @@
 .DS_Store
 Thumbs.db
 
+# Claude Code 工具产物 (workflow 脚手架脚本等), 本地研究用, 不进仓库。
+.cc-*.workflow.js
+
 # 被借鉴的第三方参考源码: 仅本地参考工具设计 (架构 §10), 不随开源仓库分发。
 /claude-code-main/
 
