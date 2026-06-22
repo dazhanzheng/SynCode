@@ -1,206 +1,119 @@
-//! 自动、预算触发的 context 压缩控制器 (支柱 1 核心: 「完全掌控 context 裁切」)。
+//! 自动 context 压缩 (支柱 1): **稳定确定性的 N-轮 user-turn 滚动窗口** + 远端 LLM 结构化重组摘要兜底。
 //!
-//! per-request 的投影裁切 (`llm::context`) 只是**原语**; 本模块是缺失的那个**控制器**:
-//! 度量预算 → 按**信息损失递增**的阶梯升级裁切。设计基线:
-//! - 全程只算/改 **wire 投影**; canonical 全文 log 永不动 (D1)。
-//! - 压力 ≤ `soft_threshold` → 维持配置的默认投影 (今天的行为, **cache-stable**, 不重写可缓存前缀)。
-//! - 超预算才爬阶梯; 每升一档都会重写可缓存前缀 → 必然 cache miss, 故**一步到位、批量**升, 不每轮 dribble。
-//! - 每档都映射到**现有** [`TrimPolicy`] 旋钮, 高档 subsume 低档 (单调)。`TrimPolicy::apply` 里
-//!   「最近工具结果窗口钳到 ≥1」已保证最新工具结果在任何档都不被动。
-//!
-//! LLM 摘要 (顶档) 见 [`crate::agent`] 的 `summarize` 路径 —— 仅当结构阶梯压不到 `hard_threshold` 时点燃。
+//! 设计 (2026-06, 取代早先的「token 阈值 + 工具轮单位阶梯」):
+//! - **不设 token 上限**: 投影 = 永远保最近 [`KEEP_RECENT_TURNS`] 个 **user-turn** 的原文 (CoT + tool
+//!   result), 更旧的 turn **确定性地** 删 CoT + stub result。单位是 **user-turn 而非工具轮** —— 一个任务
+//!   里可能有很多次 tool call, 按轮数留才不会在任务中途被裁掉上下文。
+//! - **稳定 = 缓存友好**: 同一段历史每轮投影出**同样的字节**, 前缀缓存只在「某轮从完整滑成 stub」那一个
+//!   边界破一次 (有界、可预测), 不像「临时连续裁」那样反复 thrash 缓存 (省的不如花的)。
+//! - **窗口即界**: context 自稳定在 ≈ 最近 N 轮的大小, 增长合理可控、易管理。
+//! - **trim-on-ingest 病态兜底**: 单个超大 result (> [`MAX_RESULT_CHARS`]) 即便在窗口内也头尾截断, 防
+//!   一轮读 50 个文件把窗口撑爆。
+//! - **LLM 摘要 (远端, 罕见)**: 仅当连「窗口投影」都超过真实窗口的 `summary_fraction` (5 轮巨大 / 跨任务)
+//!   时点, 把旧 (已 stub) 前缀**结构化重组**成一段印象。canonical 全文永不删 (D1)。
+//! - **recall 暂不做**: 旧细节要回, 重跑 tool 即可 (决策记录: 召回价值塌缩成贵/不可复现/时效对照的窄带,
+//!   且不该跨结构化重组存活)。
 
-use syncode_llm::context::{drop_oldest_round, estimate_tokens, normalize_for_api, TrimPolicy};
+use syncode_llm::context::{normalize_for_api, truncate_middle};
 use syncode_llm::wire::{Message, Role};
 
-/// 受保护的「最近 user 轮」数: 这么多个最新轮**永不**被结构性删除 (DropOldest 档的下限)。
-pub const PROTECTED_TAIL_SPANS: usize = 3;
+/// 保留原文的最近 user-turn 数 (窗口大小)。窗口即界, 故无需 token 上限。
+pub const KEEP_RECENT_TURNS: usize = 5;
+/// 单个 tool result 在投影里的字符上限 (病态兜底: 一轮巨量输出也不撑爆窗口)。超出头尾截断。
+pub const MAX_RESULT_CHARS: usize = 200_000;
 
-/// 预算账本: 镜像 CC autoCompact 的阈值数学, 按 DeepSeek 窗口尺寸调。
+/// 远端 LLM 摘要的预算 (仅用于「连窗口都太大」的高水位判断; 不再做 token-阈值阶梯)。
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     /// 模型上下文窗口 (token)。
     pub context_window: usize,
-    /// 给模型自身 completion + CoT 预留。
-    pub output_reserve: usize,
-    /// 跑一次 LLM 摘要所需的 headroom。
-    pub summary_reserve: usize,
-    /// 给 estimate_tokens 低估留的 slack。
-    pub safety_buffer: usize,
+    /// 窗口投影超过 `context_window * summary_fraction` 才点 LLM 摘要 (罕见)。
+    pub summary_fraction: f64,
 }
 
 impl Budget {
-    /// 软触发: 超过它就在发送前跑结构阶梯。
-    pub fn soft_threshold(&self) -> usize {
-        self.context_window
-            .saturating_sub(self.output_reserve + self.safety_buffer)
-    }
-    /// 硬触发: 结构阶梯都压不下去 → 该上 LLM 摘要顶档。
-    pub fn hard_threshold(&self) -> usize {
-        self.soft_threshold().saturating_sub(self.summary_reserve)
+    /// 高水位 token: 窗口投影超过它才点 LLM 摘要。
+    pub fn summary_high_water(&self) -> usize {
+        (self.context_window as f64 * self.summary_fraction) as usize
     }
 }
 
 impl Default for Budget {
-    /// DeepSeek v4 (1M 窗)。soft = 1_000_000 - 64_000 - 64_000 = 872_000; hard = 832_000。
-    /// 1M 窗下绝大多数会话压根撞不到阈值 → 一直停在 Baseline (cache-stable); 结构阶梯 / LLM 摘要是
-    /// **超长会话**的安全阀。`output_reserve` 给 completion(max_tokens) + 高强度 CoT 留足; `safety_buffer`
-    /// 覆盖 estimate 在大 log 上的绝对低估 (真正纠偏靠 server prompt_tokens 回环)。窗口尺寸可经
-    /// [`AgentLoop::with_budget`](crate::agent::AgentLoop::with_budget) 覆盖。
+    /// DeepSeek v4 (1M 窗); 摘要在窗口投影超 ~800k 时才点 (5 轮巨大 / 跨任务, 极罕见)。
     fn default() -> Self {
-        Self {
-            context_window: 1_000_000,
-            output_reserve: 64_000,
-            summary_reserve: 40_000,
-            safety_buffer: 64_000,
-        }
+        Self { context_window: 1_000_000, summary_fraction: 0.8 }
     }
 }
 
-/// 压缩阶梯档位, 按信息损失**单调递增**。`Ord` 派生用于「不低于某 floor」比较。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Rung {
-    /// 配置的默认投影 (= 今天的行为): keep_recent_cot=1 + 回收在途 CoT。cache-stable。
-    Baseline = 0,
-    /// 删**所有闭合轮** CoT (keep_recent_cot_rounds=0; 在途轮仍 `Some("")` 不 400)。
-    ReclaimCot,
-    /// 旧工具结果头尾软截断 (max_tool_result_chars)。
-    SoftTruncate,
-    /// 旧工具结果体替成 marker (stub)。
-    StubResults,
-    /// 结构性删最旧的完整 user 轮 (护住最近 `PROTECTED_TAIL_SPANS` 轮)。
-    DropOldest,
-}
-
-impl Rung {
-    pub fn label(self) -> &'static str {
-        match self {
-            Rung::Baseline => "baseline",
-            Rung::ReclaimCot => "reclaim-cot",
-            Rung::SoftTruncate => "soft-truncate",
-            Rung::StubResults => "stub-results",
-            Rung::DropOldest => "drop-oldest",
-        }
-    }
-}
-
-/// 一次压缩决策的产物。
-#[derive(Debug, Clone)]
-pub struct Compacted {
-    /// 选中的档位。
-    pub rung: Rung,
-    /// 现算出的待发送 wire messages。
-    pub wire: Vec<Message>,
-    /// 压缩前的 token 估算 (baseline 投影)。
-    pub before: usize,
-    /// 压缩后的 token 估算。
-    pub after: usize,
-}
-
-/// 把一个档位翻译成具体 [`TrimPolicy`] (从配置的 `base` 起, 高档叠加更激进的旋钮)。
-fn policy_for(base: &TrimPolicy, rung: Rung) -> TrimPolicy {
-    let mut p = base.clone();
-    if rung >= Rung::ReclaimCot {
-        p.keep_recent_cot_rounds = 0;
-    }
-    if rung >= Rung::SoftTruncate {
-        // 取更激进者 (若 base 已配了更小的上限, 保留之)。
-        p.max_tool_result_chars = Some(p.max_tool_result_chars.unwrap_or(2_000).min(2_000));
-    }
-    if rung >= Rung::StubResults {
-        p.stub_tool_results = true;
-    }
-    p
-}
-
-/// 删最旧的一个完整 user 轮, 但**护住最近 `keep_spans` 个 user 轮**。返回是否真的删了
-/// (false = 已到保护边界, 无可删)。在 clone 上调用 —— canonical 永不动 (D1)。
-fn drop_oldest_above_floor(messages: &mut Vec<Message>, keep_spans: usize) -> bool {
-    let user_count = messages.iter().filter(|m| m.role == Role::User).count();
-    if user_count <= keep_spans {
-        return false;
-    }
-    let before = messages.len();
-    drop_oldest_round(messages);
-    messages.len() < before
-}
-
-/// 选**能装进 `target` 的最低档** (纯函数, 零模型成本, 零延迟)。`floor` = 反应式兜底强制的下限档。
-fn climb_structural(base: &TrimPolicy, log: &[Message], target: usize, floor: Rung) -> (Rung, Vec<Message>) {
-    for rung in [Rung::Baseline, Rung::ReclaimCot, Rung::SoftTruncate, Rung::StubResults] {
-        if rung < floor {
-            continue;
-        }
-        let wire = normalize_for_api(&policy_for(base, rung).project(log));
-        if estimate_tokens(&wire) <= target {
-            return (rung, wire);
-        }
-    }
-    // 到 StubResults 仍超 → 结构删最旧轮循环 (护住保护尾)。
-    let mut projected = policy_for(base, Rung::StubResults).project(log);
-    loop {
-        let wire = normalize_for_api(&projected);
-        if estimate_tokens(&wire) <= target {
-            return (Rung::DropOldest, wire);
-        }
-        if !drop_oldest_above_floor(&mut projected, PROTECTED_TAIL_SPANS) {
-            // 已到保护边界: 尽力而为 (剩下的交给 LLM 摘要顶档 / 反应式重试)。
-            return (Rung::DropOldest, normalize_for_api(&projected));
-        }
-    }
-}
-
-/// 控制器入口: 给定 canonical `log` + 预算 + 上一轮 server 的精确 `measured` prompt_tokens (可选)
-/// + 反应式 `floor` (默认 `Baseline`), 现算要发送的 wire messages。
-///
-/// 压力 = max(当前 baseline 投影的 estimate, 上一轮 server prompt_tokens)。前者抓「log 又长了」,
-/// 后者用 server 精确值纠正 estimate 的系统性低估。压力 ≤ soft 且 floor=Baseline → 维持今天的行为。
-pub fn compact_for_send(
-    base: &TrimPolicy,
-    log: &[Message],
-    budget: &Budget,
-    measured: Option<usize>,
-    floor: Rung,
-) -> Compacted {
-    let baseline = normalize_for_api(&base.project(log));
-    let before = estimate_tokens(&baseline);
-    let pressure = before.max(measured.unwrap_or(0));
-    let target = budget.soft_threshold();
-
-    if pressure <= target && floor == Rung::Baseline {
-        return Compacted { rung: Rung::Baseline, after: before, wire: baseline, before };
-    }
-    // estimate 系统性低估: 若 server 的精确读数 `pressure` 高于本地 `before` 估算, 说明估算偏小 factor
-    // = pressure/before。把结构阶梯的 target 按同比例**收紧**, 让「estimate(wire) ≤ scaled」等价于
-    // 「真实 tokens ≤ target」—— 用 server 精确值纠偏, 而非盲信 estimate (u128 防中间溢出)。
-    let scaled_target = if pressure > before && before > 0 {
-        ((target as u128 * before as u128) / pressure as u128) as usize
-    } else {
-        target
-    };
-    let (rung, wire) = climb_structural(base, log, scaled_target, floor);
-    let after = estimate_tokens(&wire);
-    Compacted { rung, wire, before, after }
-}
-
-/// 前导 system 前缀之后第一条消息的下标 (= 可裁切区的起点; system/tools 前缀永不动, §12)。
+/// 前导 system 前缀之后第一条消息的下标 (system/tools 前缀永不动, §12)。
 pub fn first_non_system_index(msgs: &[Message]) -> usize {
     msgs.iter().position(|m| m.role != Role::System).unwrap_or(msgs.len())
 }
 
-/// 受保护尾部的起点 = 倒数第 `keep_spans` 个 user 消息的下标 (该 user 起的若干轮保留 verbatim)。
-/// 少于 `keep_spans + 1` 个 user → `None` (没有足够老的前缀值得摘要)。
-pub fn protected_tail_start(msgs: &[Message], keep_spans: usize) -> Option<usize> {
+/// 受保护尾部 (最近 `keep_turns` 个 user-turn) 的起点下标; user 不足 `keep_turns + 1` → `None` (全保留)。
+/// 边界落在 user 消息上, 故其之前的 turn 都已被后续 user「关闭」(CoT 可安全置 None、不 400)。
+pub fn protected_tail_start(msgs: &[Message], keep_turns: usize) -> Option<usize> {
     let user_idxs: Vec<usize> = msgs
         .iter()
         .enumerate()
         .filter(|(_, m)| m.role == Role::User)
         .map(|(i, _)| i)
         .collect();
-    if user_idxs.len() <= keep_spans {
+    if user_idxs.len() <= keep_turns {
         return None;
     }
-    Some(user_idxs[user_idxs.len() - keep_spans])
+    Some(user_idxs[user_idxs.len() - keep_turns])
+}
+
+/// 旧 (已关闭) turn 的 tool result 被 stub 成的占位 (带 teaser, 帮模型判断要不要重跑该 tool)。
+fn stub_teaser(content: &str) -> String {
+    let n = content.chars().count();
+    let head: String = content.chars().take(80).collect::<String>().replace('\n', " ");
+    format!("[earlier tool result trimmed ({n} chars; began: \"{head}…\") — re-run the tool if you need it]")
+}
+
+/// **稳定确定性 N-轮滚动窗口投影** (核心): 保最近 `keep_turns` 个 user-turn 的原文; 更旧的 turn 删 CoT +
+/// stub result; 任何位置单个超大 result 头尾截断 (病态兜底)。末尾 normalize 兜底删孤儿。canonical 不动。
+pub fn project_window(log: &[Message], keep_turns: usize) -> Vec<Message> {
+    let mut out = log.to_vec();
+    let boundary = protected_tail_start(log, keep_turns).unwrap_or(0);
+    for (i, m) in out.iter_mut().enumerate() {
+        if i < boundary {
+            // 旧 (已关闭) turn: 删 CoT (closed → None 合法、不 400) + stub result。
+            if m.role == Role::Assistant {
+                m.reasoning_content = None;
+            }
+            if m.role == Role::Tool {
+                if let Some(c) = &m.content {
+                    m.content = Some(stub_teaser(c));
+                }
+            }
+        } else if m.role == Role::Tool {
+            // 窗口内: 原文保留, 但单个超大 result 头尾截断 (一轮巨量输出的兜底)。
+            if let Some(c) = &m.content {
+                if c.chars().count() > MAX_RESULT_CHARS {
+                    m.content = Some(truncate_middle(c, MAX_RESULT_CHARS));
+                }
+            }
+        }
+    }
+    normalize_for_api(&out)
+}
+
+/// 摘要present时的投影: `system 前缀` + `摘要(单条 user)` + `尾部的窗口投影`。末尾 normalize 兜底。
+/// `boundary` = 摘要边界 (canonical 下标): `[first_non_system .. boundary)` 已被 `summary` 代表。
+pub fn assemble_with_summary(
+    log: &[Message],
+    keep_turns: usize,
+    summary: &Message,
+    boundary: usize,
+) -> Vec<Message> {
+    let prefix_end = first_non_system_index(log);
+    let boundary = boundary.clamp(prefix_end, log.len());
+    let mut w: Vec<Message> = log[..prefix_end].to_vec();
+    w.push(summary.clone());
+    w.extend(project_window(&log[boundary..], keep_turns));
+    normalize_for_api(&w)
 }
 
 /// 把一段 messages 摊平成可读文本喂给摘要器 (角色 + 文本 + 工具调用/结果摘要; CoT 不入摘要输入)。
@@ -229,48 +142,11 @@ pub fn flatten_for_summary(msgs: &[Message]) -> String {
     s
 }
 
-/// 组装带 LLM 摘要的 wire (顶档): `system 前缀` + `摘要(单条 user)` + `受预算控制的尾部投影`。
-/// 尾部仍走结构阶梯 (传 measured=None: 摘要后尾部通常很小 → Baseline)。末尾 normalize 兜底删切口孤儿。
-/// canonical 不动 (D1): 摘要只是投影侧产物。
-pub fn assemble_with_summary(
-    base: &TrimPolicy,
-    msgs: &[Message],
-    budget: &Budget,
-    floor: Rung,
-    summary: &Message,
-    boundary: usize,
-) -> Compacted {
-    let prefix_end = first_non_system_index(msgs);
-    let boundary = boundary.clamp(prefix_end, msgs.len());
-    let baseline = normalize_for_api(&base.project(msgs));
-    let before = estimate_tokens(&baseline);
-
-    let tail = &msgs[boundary..];
-    let tail_compacted = compact_for_send(base, tail, budget, None, floor);
-
-    let mut w: Vec<Message> = msgs[..prefix_end].to_vec();
-    w.push(summary.clone());
-    w.extend_from_slice(&tail_compacted.wire);
-    let wire = normalize_for_api(&w);
-    let after = estimate_tokens(&wire);
-    Compacted { rung: Rung::DropOldest, wire, before, after }
-}
-
-/// 下一个更激进的档 (反应式兜底用)。已到顶 (DropOldest) 返回 None。
-pub fn next_rung(rung: Rung) -> Option<Rung> {
-    match rung {
-        Rung::Baseline => Some(Rung::ReclaimCot),
-        Rung::ReclaimCot => Some(Rung::SoftTruncate),
-        Rung::SoftTruncate => Some(Rung::StubResults),
-        Rung::StubResults => Some(Rung::DropOldest),
-        Rung::DropOldest => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syncode_llm::wire::{FunctionCall, Role, ToolCall};
+    use syncode_llm::context::estimate_tokens;
+    use syncode_llm::wire::{FunctionCall, ToolCall};
 
     fn asst_tool(id: &str, reasoning: &str) -> Message {
         Message {
@@ -287,125 +163,111 @@ mod tests {
         }
     }
 
-    /// system + N 个工具轮 (每轮长 reasoning + 长结果) + 末尾回答。
-    fn big_log(rounds: usize) -> Vec<Message> {
-        let mut log = vec![Message::system("you are a coding agent")];
-        for i in 0..rounds {
-            log.push(Message::user(format!("user turn {i}")));
-            log.push(asst_tool(&format!("c{i}"), &"reasoning ".repeat(300)));
-            log.push(Message::tool_result(&format!("c{i}"), &"BIG RESULT ".repeat(800)));
+    /// system + n 个 turn (每 turn = user + 工具轮(带 CoT) + 结果)。
+    fn turns(n: usize) -> Vec<Message> {
+        let mut log = vec![Message::system("sys")];
+        for i in 0..n {
+            log.push(Message::user(format!("turn {i}")));
+            log.push(asst_tool(&format!("c{i}"), &format!("reasoning {i}")));
+            log.push(Message::tool_result(&format!("c{i}"), &format!("RESULT {i}")));
         }
-        log.push(Message::user("latest".to_string()));
-        log.push(asst_tool("clast", &"recent reasoning".repeat(50)));
-        log.push(Message::tool_result("clast", "RECENT RESULT keep me intact"));
         log
     }
 
-    fn tiny_budget(window: usize) -> Budget {
-        Budget { context_window: window, output_reserve: 0, summary_reserve: 0, safety_buffer: 0 }
+    fn result_of(wire: &[Message], call: &str) -> Option<String> {
+        wire.iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(call))
+            .and_then(|m| m.content.clone())
+    }
+    fn cot_of(wire: &[Message], call: &str) -> Option<Option<String>> {
+        wire.iter()
+            .find(|m| m.has_tool_calls() && m.tool_calls.as_ref().unwrap()[0].id == call)
+            .map(|m| m.reasoning_content.clone())
     }
 
     #[test]
-    fn under_budget_stays_baseline_and_cache_stable() {
-        let log = big_log(2);
-        // 超大窗口 → 压力远低于 soft → Baseline。
-        let c = compact_for_send(&TrimPolicy::default(), &log, &Budget::default(), None, Rung::Baseline);
-        assert_eq!(c.rung, Rung::Baseline);
+    fn under_keep_turns_keeps_everything_full() {
+        let log = turns(3);
+        let wire = project_window(&log, KEEP_RECENT_TURNS); // 3 <= 5 → 全保留
+        assert_eq!(result_of(&wire, "c0").as_deref(), Some("RESULT 0"));
+        assert_eq!(cot_of(&wire, "c0"), Some(Some("reasoning 0".to_string())));
     }
 
     #[test]
-    fn over_budget_climbs_and_shrinks() {
-        let log = big_log(6);
-        let baseline_tokens = estimate_tokens(&normalize_for_api(&TrimPolicy::default().project(&log)));
-        // 把窗口设在 baseline 的一半 → 必须爬阶梯压下来。
-        let budget = tiny_budget(baseline_tokens / 2);
-        let c = compact_for_send(&TrimPolicy::default(), &log, &budget, None, Rung::Baseline);
-        assert_ne!(c.rung, Rung::Baseline, "should have climbed off baseline");
-        assert!(c.after < c.before, "compaction must shrink: {} -> {}", c.before, c.after);
-        assert!(c.after <= budget.soft_threshold() || c.rung == Rung::DropOldest,
-            "should fit under target unless it hit the protected-tail floor");
+    fn keeps_recent_turns_full_trims_older() {
+        let log = turns(8); // 8 个 user-turn, keep 5 → turn 0,1,2 旧; 3..7 在窗
+        let wire = project_window(&log, 5);
+        // 旧 turn 0: result stub + CoT 删。
+        assert!(result_of(&wire, "c0").unwrap().starts_with("[earlier tool result trimmed"));
+        assert_eq!(cot_of(&wire, "c0"), Some(None), "old closed-turn CoT must be dropped");
+        // 窗口内 turn 7 (最近): result + CoT 原样。
+        assert_eq!(result_of(&wire, "c7").as_deref(), Some("RESULT 7"));
+        assert_eq!(cot_of(&wire, "c7"), Some(Some("reasoning 7".to_string())));
+        // 窗口边界 turn 3: 在窗 → 原样。
+        assert_eq!(result_of(&wire, "c3").as_deref(), Some("RESULT 3"));
     }
 
     #[test]
-    fn most_recent_tool_result_survives_every_rung() {
-        let log = big_log(6);
-        let budget = tiny_budget(50); // 极紧 → 一路爬到 DropOldest
-        let c = compact_for_send(&TrimPolicy::default(), &log, &budget, None, Rung::Baseline);
-        let recent = c.wire.iter().rev().find(|m| m.role == Role::Tool);
-        assert_eq!(
-            recent.and_then(|m| m.content.as_deref()),
-            Some("RECENT RESULT keep me intact"),
-            "newest tool result must never be stubbed/dropped (rung={:?})", c.rung
-        );
+    fn most_recent_result_always_intact() {
+        let log = turns(20);
+        let wire = project_window(&log, 5);
+        let recent = wire.iter().rev().find(|m| m.role == Role::Tool);
+        assert_eq!(recent.and_then(|m| m.content.clone()).as_deref(), Some("RESULT 19"));
     }
 
     #[test]
-    fn server_measured_overrides_low_estimate() {
-        let log = big_log(1);
-        let budget = Budget::default();
-        // estimate 很小 → 本会 Baseline; 但 server 说 prompt 已 900k (> soft 872k) → 强制爬阶梯。
-        let c = compact_for_send(&TrimPolicy::default(), &log, &budget, Some(900_000), Rung::Baseline);
-        assert_ne!(c.rung, Rung::Baseline, "server-measured pressure must trigger compaction");
+    fn oversized_result_in_window_is_capped() {
+        let mut log = turns(1);
+        // turn 0 在窗 (只有 1 turn), 但其 result 巨大 → 头尾截断。
+        if let Some(m) = log.iter_mut().find(|m| m.role == Role::Tool) {
+            m.content = Some("X".repeat(MAX_RESULT_CHARS + 50_000));
+        }
+        let wire = project_window(&log, 5);
+        let n = result_of(&wire, "c0").unwrap().chars().count();
+        assert!(n <= MAX_RESULT_CHARS, "oversized window result must be capped, got {n}");
     }
 
     #[test]
-    fn reactive_floor_forces_minimum_rung() {
-        let log = big_log(2);
-        // 窗口够大本会 Baseline, 但 floor 强制 ≥ StubResults (反应式兜底场景)。
-        let c = compact_for_send(&TrimPolicy::default(), &log, &Budget::default(), None, Rung::StubResults);
-        assert!(c.rung >= Rung::StubResults, "floor must pin the minimum rung, got {:?}", c.rung);
+    fn deterministic_same_history_same_bytes() {
+        // 稳定性 = 缓存友好: 同一段历史投影两次, 字节一致。
+        let log = turns(9);
+        let a = project_window(&log, 5);
+        let b = project_window(&log, 5);
+        assert_eq!(estimate_tokens(&a), estimate_tokens(&b));
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.content, y.content);
+            assert_eq!(x.reasoning_content, y.reasoning_content);
+        }
     }
 
     #[test]
-    fn structurally_valid_after_compaction() {
-        let log = big_log(6);
-        let budget = tiny_budget(80);
-        let c = compact_for_send(&TrimPolicy::default(), &log, &budget, None, Rung::Baseline);
-        // 再过一遍 normalize 应幂等 (无孤儿 / 未配对)。
-        assert_eq!(normalize_for_api(&c.wire).len(), c.wire.len(), "compacted wire must be structurally valid");
-    }
-
-    // ---- 摘要顶档的纯函数部分 (live LLM 调用不在此单测) ----
-
-    #[test]
-    fn first_non_system_index_skips_prefix() {
-        let log = vec![Message::system("a"), Message::system("b"), Message::user("u")];
-        assert_eq!(first_non_system_index(&log), 2);
-        assert_eq!(first_non_system_index(&[Message::system("only")]), 1);
+    fn structurally_valid_after_window() {
+        let log = turns(10);
+        let wire = project_window(&log, 5);
+        assert_eq!(normalize_for_api(&wire).len(), wire.len(), "windowed wire must be structurally valid");
     }
 
     #[test]
-    fn protected_tail_start_needs_enough_spans() {
-        let small = vec![Message::system("s"), Message::user("u1")];
-        assert!(protected_tail_start(&small, 3).is_none(), "1 user < 3 spans → nothing to summarize");
-        let log = big_log(4); // 5 个 user 轮
-        let idx = protected_tail_start(&log, 3).expect("5 users > 3 spans");
-        assert_eq!(log[idx].role, Role::User, "boundary must land on a user message");
+    fn protected_tail_start_unit() {
+        let log = turns(8);
+        let b = protected_tail_start(&log, 5).expect("8 > 5");
+        assert_eq!(log[b].role, Role::User);
+        assert_eq!(log[b].content.as_deref(), Some("turn 3")); // 倒数第 5 个 user
+        assert!(protected_tail_start(&turns(3), 5).is_none());
     }
 
     #[test]
-    fn assemble_with_summary_replaces_prefix_keeps_tail() {
-        let log = big_log(4);
-        let boundary = protected_tail_start(&log, PROTECTED_TAIL_SPANS).expect("enough spans");
-        let summary = Message::user("[summary] earlier work compacted here");
-        let c = assemble_with_summary(
-            &TrimPolicy::default(), &log, &Budget::default(), Rung::Baseline, &summary, boundary,
-        );
-        assert_eq!(c.wire[0].role, Role::System, "system prefix preserved");
-        assert_eq!(c.wire[1].role, Role::User, "summary injected as a user message");
-        assert!(c.wire[1].content.as_deref().unwrap().contains("[summary]"));
-        // 最近的工具结果必须 verbatim 保留。
-        let recent = c.wire.iter().rev().find(|m| m.role == Role::Tool);
-        assert_eq!(recent.and_then(|m| m.content.as_deref()), Some("RECENT RESULT keep me intact"));
-        // 结构合法 + 真的变小。
-        assert_eq!(normalize_for_api(&c.wire).len(), c.wire.len(), "must be structurally valid");
-        assert!(c.after < c.before, "summary projection must shrink: {} -> {}", c.before, c.after);
-    }
-
-    #[test]
-    fn flatten_for_summary_includes_roles_and_calls() {
-        let flat = flatten_for_summary(&big_log(1));
-        assert!(flat.contains("[user]"), "{flat}");
-        assert!(flat.contains("-> call"), "tool calls should be flattened: {flat}");
+    fn assemble_with_summary_keeps_prefix_and_window() {
+        let log = turns(8);
+        let boundary = protected_tail_start(&log, 5).unwrap();
+        let summary = Message::user("[summary] older turns folded");
+        let wire = assemble_with_summary(&log, 5, &summary, boundary);
+        assert_eq!(wire[0].role, Role::System);
+        assert_eq!(wire[1].role, Role::User);
+        assert!(wire[1].content.as_deref().unwrap().contains("[summary]"));
+        // 最近一轮仍在。
+        let recent = wire.iter().rev().find(|m| m.role == Role::Tool);
+        assert_eq!(recent.and_then(|m| m.content.clone()).as_deref(), Some("RESULT 7"));
+        assert_eq!(normalize_for_api(&wire).len(), wire.len());
     }
 }

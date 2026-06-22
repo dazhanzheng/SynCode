@@ -9,8 +9,8 @@
 
 use crate::background::BackgroundRegistry;
 use crate::compaction::{
-    assemble_with_summary, compact_for_send, first_non_system_index, flatten_for_summary, next_rung,
-    protected_tail_start, Budget, Rung, PROTECTED_TAIL_SPANS,
+    assemble_with_summary, first_non_system_index, flatten_for_summary, project_window,
+    protected_tail_start, Budget, KEEP_RECENT_TURNS,
 };
 use crate::context::ContextManager;
 use crate::file_state::FileStateCache;
@@ -73,8 +73,12 @@ pub enum AgentEvent {
 /// 后端 `InsufficientSystemResource` 的重试上限 (防永久空转, §16; 原 TODO)。
 const MAX_RESOURCE_RETRIES: u32 = 5;
 
-/// LLM 摘要顶档的连续失败熔断阈值 (借鉴 CC): 连失这么多次就不再尝试摘要 (退回纯结构阶梯)。
+/// LLM 摘要的连续失败熔断阈值 (借鉴 CC): 连失这么多次就不再尝试摘要 (退回纯窗口投影)。
 const MAX_SUMMARIZE_FAILS: u32 = 3;
+/// 摘要请求的 max_tokens 上限。
+const SUMMARY_MAX_TOKENS: u32 = 32_000;
+/// context 过长的 400 反应式重试上限 (每次先强制摘要再重发, 防永久空转)。
+const MAX_SUMMARY_RETRIES: u32 = 2;
 
 /// 事件回调汇 (在 agent 的 async 上下文里**同步**调用; 实现应是非阻塞的, 如往 channel 投递)。
 pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
@@ -117,10 +121,8 @@ pub struct AgentLoop {
     session_id: String,
     /// 自动压缩预算 (支柱 1): 决定 soft/hard 阈值。
     budget: Budget,
-    /// 上一轮 server 回传的精确 prompt_tokens (喂回压缩控制环, 纠正 estimate 低估)。
+    /// 上一轮 server 回传的精确 prompt_tokens (用于「连窗口都太大」的摘要高水位判断)。
     last_prompt_tokens: Option<usize>,
-    /// 反应式压缩下限档: 每个 turn 起点重置 `Baseline`; 命中 context 过长的 400 时强升一档。
-    compaction_floor: Rung,
     /// LLM 摘要顶档产物 (单条 user 消息): 一旦摘要过, 投影 = system 前缀 + 它 + 尾部。canonical 不动 (D1)。
     summary_msg: Option<Message>,
     /// 摘要边界 (canonical 下标): `[first_non_system .. boundary)` 已被 `summary_msg` 代表, 投影从此处起。
@@ -149,7 +151,6 @@ impl AgentLoop {
             session_id: "default".to_string(),
             budget: Budget::default(),
             last_prompt_tokens: None,
-            compaction_floor: Rung::Baseline,
             summary_msg: None,
             compaction_boundary: None,
             summarize_fails: 0,
@@ -157,7 +158,7 @@ impl AgentLoop {
         }
     }
 
-    /// 覆盖自动压缩预算 (按模型窗口尺寸调 soft/hard 阈值)。
+    /// 覆盖自动压缩预算 (按模型窗口尺寸调 LLM 摘要的高水位; 日常裁切走固定的 N-轮窗口, 与此无关)。
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
         self
@@ -287,41 +288,19 @@ impl AgentLoop {
     /// 组装一次请求: 从 canonical 投影出裁切后的 wire messages + 结构 normalize (③),
     /// 思考模式 + max 强度 (复杂 agent 场景, §7.1), 带全部工具定义。
     fn build_request(&self, session: &Session) -> ChatRequest {
-        // 自动压缩控制器 (支柱 1): 度量预算 → 按信息损失递增的阶梯升级裁切 (只算 wire 投影, canonical 不动)。
+        // 自动压缩 (支柱 1): 稳定的 N-轮 user-turn 滚动窗口投影 (只算 wire, canonical 不动)。
+        // 有 LLM 摘要时: system 前缀 + 摘要 + 尾部窗口投影; 否则: 直接窗口投影。摘要事件在 `maybe_summarize`
+        // 里发过, 此处不发 (routine 窗口化是每轮的常态, 静默)。
         let msgs = session.messages();
-        let compacted = match (&self.summary_msg, self.compaction_boundary) {
-            // 顶档: 已有 LLM 摘要 (且 boundary 仍落在当前 log 内) → system 前缀 + 摘要 + 尾部投影。
-            // 摘要事件在 `maybe_summarize` 里已发过一次, 这里不再每轮重发。
-            (Some(summary), Some(boundary)) if boundary < msgs.len() => assemble_with_summary(
-                &self.context.policy,
-                msgs,
-                &self.budget,
-                self.compaction_floor,
-                summary,
-                boundary,
-            ),
-            // 结构阶梯: 压力 ≤ soft 且无反应式 floor → Baseline (cache-stable)。超预算才爬。
-            _ => {
-                let c = compact_for_send(
-                    &self.context.policy,
-                    msgs,
-                    &self.budget,
-                    self.last_prompt_tokens,
-                    self.compaction_floor,
-                );
-                if c.rung != Rung::Baseline {
-                    self.emit(AgentEvent::Compacted {
-                        rung: c.rung.label().to_string(),
-                        before: c.before as u64,
-                        after: c.after as u64,
-                    });
-                }
-                c
+        let wire = match (&self.summary_msg, self.compaction_boundary) {
+            (Some(summary), Some(boundary)) if boundary < msgs.len() => {
+                assemble_with_summary(msgs, KEEP_RECENT_TURNS, summary, boundary)
             }
+            _ => project_window(msgs, KEEP_RECENT_TURNS),
         };
         ChatRequest {
             model: MODEL.to_string(),
-            messages: compacted.wire,
+            messages: wire,
             thinking: Some(Thinking { kind: ThinkingType::Enabled }),
             reasoning_effort: Some(ReasoningEffort::Max),
             // 无工具时不发 tools 字段; 思考模式下 tool_choice 只能 None/auto/none (传 required 会 400)。
@@ -348,11 +327,11 @@ impl AgentLoop {
     /// 摘要请求本身: 非流式、thinking 关、无工具、专用摘要 system prompt。
     async fn maybe_summarize(&mut self, session: &Session) {
         if self.summarize_fails >= MAX_SUMMARIZE_FAILS {
-            return; // 熔断: 连失太多次, 退回纯结构阶梯
+            return; // 熔断: 连失太多次, 退回纯窗口投影
         }
         let msgs = session.messages();
-        let Some(boundary) = protected_tail_start(msgs, PROTECTED_TAIL_SPANS) else {
-            return; // user 轮不足以划出「旧前缀 + 受保护尾部」
+        let Some(boundary) = protected_tail_start(msgs, KEEP_RECENT_TURNS) else {
+            return; // user 轮不足以划出「旧前缀 + 受保护窗口」
         };
         let prefix_end = first_non_system_index(msgs);
         if boundary <= prefix_end {
@@ -369,7 +348,7 @@ impl AgentLoop {
             reasoning_effort: None,
             tools: None,
             tool_choice: None,
-            max_tokens: Some(self.budget.summary_reserve as u32),
+            max_tokens: Some(SUMMARY_MAX_TOKENS),
             temperature: None,
             stop: None,
             stream: false,
@@ -429,8 +408,8 @@ impl AgentLoop {
     /// 跑一个完整 turn 直到模型给出非 `ToolCalls`(且非 leaked tool-call)的 `finish_reason`。
     pub async fn run_turn(&mut self, session: &mut Session) -> syncode_llm::Result<()> {
         self.sync_and_checkpoint(session);
-        self.compaction_floor = Rung::Baseline; // 每个 turn 重置反应式压缩下限
         let mut resource_retries = 0u32;
+        let mut summary_retries = 0u32;
         loop {
             let request = self.build_request(session);
             // 流式: 逐 chunk 把 assistant 文本 / reasoning 增量发给 UI (实时逐字 + token 边生成边涨)。
@@ -458,18 +437,12 @@ impl AgentLoop {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    // 反应式兜底: estimate 低估漏过、DeepSeek 以 context 过长的 400 拒 → 强升一档压缩重试。
-                    // 每次升一档 (至多到 DropOldest); next_rung 到顶返回 None → 透传错误。天然有界。
-                    if is_context_length_error(&e) {
-                        if let Some(next) = next_rung(self.compaction_floor) {
-                            self.compaction_floor = next;
-                            self.emit(AgentEvent::Compacted {
-                                rung: format!("reactive:{}", next.label()),
-                                before: 0,
-                                after: 0,
-                            });
-                            continue;
-                        }
+                    // 反应式兜底: 窗口投影仍被 DeepSeek 以 context 过长的 400 拒 (5 轮巨大) → 强制摘要后重发。
+                    // 封顶 MAX_SUMMARY_RETRIES 防永久空转 (摘要可能因熔断/轮数不足 no-op)。
+                    if is_context_length_error(&e) && summary_retries < MAX_SUMMARY_RETRIES {
+                        summary_retries += 1;
+                        self.maybe_summarize(session).await;
+                        continue;
                     }
                     return Err(e);
                 }
@@ -501,8 +474,9 @@ impl AgentLoop {
                 continue;
             }
 
-            // 采纳了本次输出 → 记录 server 精确 prompt_tokens (喂回压缩控制环) + 报 token 用量。
-            let over_hard = if let Some(u) = &usage {
+            // 采纳了本次输出 → 记录 server 精确 prompt_tokens + 报 token 用量。
+            // 高水位判断: 连「窗口投影」都超过真实窗口的 summary_fraction (5 轮巨大/跨任务) → 点 LLM 摘要 (罕见)。
+            let over_high_water = if let Some(u) = &usage {
                 self.last_prompt_tokens = Some(u.prompt_tokens as usize);
                 self.emit(AgentEvent::Usage {
                     prompt_tokens: u.prompt_tokens,
@@ -515,13 +489,13 @@ impl AgentLoop {
                         .map(|d| d.reasoning_tokens)
                         .unwrap_or(0),
                 });
-                u.prompt_tokens as usize > self.budget.hard_threshold()
+                u.prompt_tokens as usize > self.budget.summary_high_water()
             } else {
                 false
             };
-            // 结构阶梯都压不下去 (server 实测仍超 hard 阈值) → 上 LLM 摘要顶档。这轮已重写前缀 = 已付
-            // cache miss (cold-cache 时机), 此时摘要最划算; 熔断后退回纯结构阶梯。canonical 仍存全文 (D1)。
-            if over_hard {
+            // 连窗口投影都超高水位 (5 轮巨大 / 跨任务) → 把旧 (已 stub) 前缀结构化重组成一段摘要 (罕见)。
+            // canonical 全文 log 不动 (D1); 熔断后退回纯窗口投影。
+            if over_high_water {
                 self.maybe_summarize(session).await;
             }
 
