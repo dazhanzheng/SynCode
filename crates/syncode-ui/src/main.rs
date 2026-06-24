@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::*;
 use gpui_component::input::{Input as TextInput, InputEvent, InputState};
@@ -19,7 +20,7 @@ use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::text::TextView;
 use gpui_component::{button::*, *};
 use syncode_core::permission::{ActionRequest, Decision, PolicyApprover};
-use syncode_core::state::SessionStore;
+use syncode_core::state::{SessionMeta, SessionStore};
 use syncode_core::{
     AgentEvent, AgentLoop, AskGate, EventSink, FsScope, Session, TodoItem, TodoStatus, ToolRegistry,
 };
@@ -52,12 +53,32 @@ mod color {
     pub fn danger_bg() -> Hsla { rgba(0xf8514912).into() }
 }
 
-/// UI → worker 的控制消息。Task 跑一轮 (累积进常驻 session); Reset 丢弃 session 开新会话;
-/// SetWorkspace 把 agent 的项目根 (cwd / 审批写根 / FsScope 收容根) 切到新目录并重建 + 开新会话。
+/// 粗略相对时间 ("just now" / "5m ago" / "3h ago" / "2d ago"), 供历史会话列表展示。
+fn rel_time(updated_at_ms: i64) -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    let secs = (now - updated_at_ms).max(0) / 1000;
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// UI → worker 的控制消息。Task 跑一轮 (累积进常驻 session); Reset 开新会话 (不删旧的);
+/// SetWorkspace 把 agent 的项目根 (cwd / 审批写根 / FsScope 收容根) 切到新目录并重建 + 开新会话;
+/// ListSessions 列当前 workspace 历史; SwitchSession 切到某条历史会话并 resume。
 enum WorkerMsg {
     Task(String),
     Reset,
     SetWorkspace(PathBuf),
+    /// 列出当前 workspace 的历史会话 (回信经 picker 通道 → UI 弹出选择器)。
+    ListSessions,
+    /// 切到某条历史会话并 resume (transcript 经 resume 通道重建)。
+    SwitchSession(String),
 }
 
 /// agent 的 system prompt: 委托给 `syncode_core` 的**单一真相** builder (CLI/UI 同源, §2),
@@ -129,6 +150,10 @@ struct AgentApp {
     _drain: Task<()>,
     _appr_drain: Task<()>,
     _resume_drain: Task<()>,
+    /// 历史会话选择器: 在途列表 + 是否展开 (展开时主区域换成选择器)。
+    sessions: Vec<SessionMeta>,
+    picker_open: bool,
+    _picker_drain: Task<()>,
 }
 
 impl AgentApp {
@@ -138,6 +163,7 @@ impl AgentApp {
         event_rx: smol::channel::Receiver<AgentEvent>,
         appr_rx: smol::channel::Receiver<ApprovalRequest>,
         resume_rx: smol::channel::Receiver<Vec<Message>>,
+        picker_rx: smol::channel::Receiver<Vec<SessionMeta>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -196,6 +222,19 @@ impl AgentApp {
                 }
             }
         });
+        // 抽干 picker 流 (worker 发来历史会话列表) → 弹出选择器。
+        let picker_drain = cx.spawn(async move |weak, cx| {
+            while let Ok(sessions) = picker_rx.recv().await {
+                let updated = weak.update(cx, |this, cx| {
+                    this.sessions = sessions;
+                    this.picker_open = true;
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
         let lines = vec![Line::Status("Ready — edit the task and press Enter (or Send).".into())];
         Self {
             // ListState 项数必须与 lines 同步 (初始 1 行)。Bottom 对齐 → 新内容贴底。
@@ -217,6 +256,9 @@ impl AgentApp {
             _drain: drain,
             _appr_drain: appr_drain,
             _resume_drain: resume_drain,
+            sessions: Vec::new(),
+            picker_open: false,
+            _picker_drain: picker_drain,
         }
     }
 
@@ -464,8 +506,31 @@ impl AgentApp {
             return;
         }
         let _ = self.task_tx.try_send(WorkerMsg::Reset);
-        self.reset_lines(vec![Line::Status("New chat — context cleared.".into())]);
+        self.reset_lines(vec![Line::Status("New chat — started a fresh session.".into())]);
         self.usage = UsageTotals::default();
+        cx.notify();
+    }
+
+    /// 打开历史会话选择器: 让 worker 列出当前 workspace 的会话 (回信经 picker 通道 → 弹出)。
+    fn open_session_picker(&mut self, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        let _ = self.task_tx.try_send(WorkerMsg::ListSessions);
+        cx.notify();
+    }
+
+    /// 选中一条历史会话: 通知 worker 切过去并 resume (transcript 经 resume 通道自动重建)。
+    fn pick_session(&mut self, session_id: String, cx: &mut Context<Self>) {
+        self.picker_open = false;
+        self.usage = UsageTotals::default();
+        let _ = self.task_tx.try_send(WorkerMsg::SwitchSession(session_id));
+        cx.notify();
+    }
+
+    /// 关闭历史会话选择器 (不切会话)。
+    fn close_session_picker(&mut self, cx: &mut Context<Self>) {
+        self.picker_open = false;
         cx.notify();
     }
 
@@ -885,9 +950,12 @@ impl Render for AgentApp {
                 .py_4()
                 .gap_3()
                 .child(self.render_header(running, cx))
+                // 主区域: picker 展开时换成历史会话选择器, 否则是 transcript。
                 // transcript = 变高虚拟列表 (list, 只渲可见行 → 内容多也不卡) + 右侧 12px 滚动条槽。
                 // 外层 flex_1+min_h(0) 给定有界视口高; list 自己处理滚动/滚轮/贴底; 滚动条读 list_state。
-                .child(
+                .child(if self.picker_open {
+                    self.render_session_picker(cx).into_any_element()
+                } else {
                     div()
                         .flex_1()
                         .min_h(px(0.))
@@ -911,8 +979,9 @@ impl Render for AgentApp {
                                     Scrollbar::vertical(&self.list_state)
                                         .scrollbar_show(ScrollbarShow::Always),
                                 ),
-                        ),
-                )
+                        )
+                        .into_any_element()
+                })
                 // 审批卡片 (仅在有在途 Ask 请求时): 阻塞中, 等人点 Allow once / Deny。
                 .children(self.pending_approval.as_ref().map(|p| self.render_approval(p, cx)))
                 .child(self.render_usage(cx))
@@ -1052,6 +1121,15 @@ impl AgentApp {
                                     })),
                             )
                             .child(
+                                Button::new("history")
+                                    .ghost()
+                                    .label("History")
+                                    .disabled(running)
+                                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                                        this.open_session_picker(cx)
+                                    })),
+                            )
+                            .child(
                                 Button::new("new-chat")
                                     .ghost()
                                     .label("New chat")
@@ -1062,6 +1140,71 @@ impl AgentApp {
                             ),
                     ),
             )
+    }
+
+    /// 历史会话选择器 (主区域内): 当前 workspace 的会话, 最近在前, 点一条即切过去 resume。
+    fn render_session_picker(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        const MAX_ROWS: usize = 12;
+        let total = self.sessions.len();
+        let rows = self.sessions.iter().take(MAX_ROWS).enumerate().map(|(ix, m)| {
+            let id = m.session_id.clone();
+            let title = m
+                .title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "(untitled session)".to_string());
+            let when = rel_time(m.updated_at);
+            div()
+                .id(("session-row", ix))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .hover(|s| s.bg(color::surface()))
+                .on_click(
+                    cx.listener(move |this, _ev, _window, cx| this.pick_session(id.clone(), cx)),
+                )
+                .child(div().text_color(theme.foreground).child(title))
+                .child(div().flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(when))
+                .into_any_element()
+        });
+        v_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().text_color(theme.foreground).child("History — this workspace"))
+                    .child(
+                        Button::new("close-picker").ghost().label("Close").on_click(
+                            cx.listener(|this, _ev, _window, cx| this.close_session_picker(cx)),
+                        ),
+                    ),
+            )
+            .children((total == 0).then(|| {
+                div()
+                    .py_4()
+                    .text_color(theme.muted_foreground)
+                    .child("No past sessions in this workspace yet.")
+            }))
+            .children((total > 0).then(|| v_flex().gap_1().children(rows)))
+            .children((total > MAX_ROWS).then(move || {
+                div()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("+{} older", total - MAX_ROWS))
+            }))
     }
 
     /// 输入框上方的 token 用量条: 左侧 输入/输出, 右侧 缓存命中/思考/总量 (会话累计)。
@@ -1333,6 +1476,7 @@ fn run_agent_worker(
     appr_tx: smol::channel::Sender<ApprovalRequest>,
     cancel_rx: smol::channel::Receiver<()>,
     resume_tx: smol::channel::Sender<Vec<Message>>,
+    picker_tx: smol::channel::Sender<Vec<SessionMeta>>,
 ) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -1424,9 +1568,18 @@ fn run_agent_worker(
         while let Ok(msg) = task_rx.recv().await {
             match msg {
                 WorkerMsg::Reset => {
-                    agent.reset_store(); // 清掉该 workspace 的持久化历史
+                    // New chat: 新开一条会话 (不删旧的; 旧会话进历史可回看)。
+                    agent.start_new_session();
                     session = Session::with_system(system_prompt(&root));
                     // UI 侧已自行 reset 到 "New chat" 状态, 不必再 send resume。
+                }
+                WorkerMsg::ListSessions => {
+                    let _ = picker_tx.try_send(agent.sessions());
+                }
+                WorkerMsg::SwitchSession(id) => {
+                    agent.switch_session(id);
+                    session = resume(&agent, &root); // 载入该会话历史
+                    let _ = resume_tx.try_send(session.messages().to_vec()); // UI 重建 transcript
                 }
                 WorkerMsg::SetWorkspace(path) => {
                     root = path;
@@ -1473,9 +1626,13 @@ fn main() {
         let (cancel_tx, cancel_rx) = smol::channel::unbounded::<()>();
         // resume 通道 (worker → UI): 开机/切 workspace 时把存档历史发给 UI 重建 transcript。
         let (resume_tx, resume_rx) = smol::channel::unbounded::<Vec<Message>>();
+        // picker 通道 (worker → UI): History 按钮请求时, worker 把会话列表发回 → 弹出选择器。
+        let (picker_tx, picker_rx) = smol::channel::unbounded::<Vec<SessionMeta>>();
 
         // agent worker 独立线程 (自带 tokio runtime)。
-        thread::spawn(move || run_agent_worker(task_rx, event_tx, appr_tx, cancel_rx, resume_tx));
+        thread::spawn(move || {
+            run_agent_worker(task_rx, event_tx, appr_tx, cancel_rx, resume_tx, picker_tx)
+        });
 
         cx.spawn(async move |cx| {
             let bounds = Bounds {
@@ -1492,7 +1649,9 @@ fn main() {
             };
             cx.open_window(options, |window, cx| {
                 let view = cx.new(|cx| {
-                    AgentApp::new(task_tx, cancel_tx, event_rx, appr_rx, resume_rx, window, cx)
+                    AgentApp::new(
+                        task_tx, cancel_tx, event_rx, appr_rx, resume_rx, picker_rx, window, cx,
+                    )
                 });
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
