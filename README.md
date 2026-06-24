@@ -74,8 +74,8 @@ flowchart TB
 | **`syncode-ast`** | tree-sitter + ast-grep 驱动的结构化搜索 / 改写 / 语法合法性校验 |
 | **`syncode-lsp`** | 进程内 LSP 客户端:常驻语言服务器 + 手写 JSON-RPC,取**真**语义事实 |
 | **`syncode-sandbox`** | 安全底座:Seatbelt(macOS)· landlock+seccomp(Linux)· Job Object(Windows)· cap-std 能力式 FS |
-| **`syncode-cli`** | headless 任务驱动入口(二进制 `syncode`) |
-| **`syncode-ui`** | gpui 桌面 UI(独立 sub-workspace,驱动**真**的 agent loop) |
+| **`syncode-ui`** | **桌面应用(gpui)— SynCode 唯一面向用户的界面**(独立 sub-workspace,驱动**真**的 agent loop) |
+| **`syncode-cli`** | headless 开发 / 评测 harness(驱动 `run_turn` 跑真 DeepSeek)——**非发布接口**,仅供开发 / 测试 |
 
 ### 🧰 工具套件 / Tool suite
 
@@ -90,43 +90,32 @@ flowchart TB
 
 **前置 / Prerequisites** — Rust stable(`rustc 1.85+`,edition 2024;见 `rust-toolchain.toml`)+ 一个 DeepSeek API key。
 
+SynCode 的界面是 **gpui 桌面应用**(`syncode-ui`)。启动它:
+
 ```sh
-# 1. 构建 / Build
-cargo build
-
-# 2. 注入 API key(切勿硬编码)/ Provide your key
-export DEEPSEEK_API_KEY="sk-..."
-
-# 3. 跑一个你给的任务(headless,单 turn 内部多轮 tool-call)
-cargo run -p syncode-cli -- "在 crates/ 下找到 Tool trait 并加一个 is_readonly 默认方法,然后 cargo build 修到编译通过"
-
-# 不带参数 → 跑一个内置 demo 任务 / a built-in demo task
-cargo run -p syncode-cli
-
-# 关掉 OS 沙箱(逃生口,默认开)/ opt out of the OS sandbox
-cargo run -p syncode-cli -- --no-sandbox "..."
+export DEEPSEEK_API_KEY="sk-..."        # 注入 API key(切勿硬编码)
+cd crates/syncode-ui && cargo run       # 启动桌面应用(唯一面向用户的界面)
 ```
 
-发布构建会在 `target/release/syncode` 产出二进制:
+> `syncode-ui` 是独立 sub-workspace(隔离 gpui 的庞大依赖树),首次构建较慢。它驱动**真**的 agent loop:
+> 流式输出、工具/推理折叠卡、交互式审批、Stop 取消、按 workspace 持久化 resume。
+
+**Headless harness(开发 / 评测用,非发布接口)/ Dev harness** — 不想构建 gpui 时,用 `syncode-cli` 直接对 DeepSeek 跑一个真的 `run_turn`(单 turn、内部多轮 tool-call),用来验证 agent loop / 工具 / 压缩:
 
 ```sh
-cargo build --release && ./target/release/syncode "your task here"
-```
-
-**桌面 UI(实验性)/ Desktop UI (experimental)** — gpui spike 自成独立 workspace(隔离其庞大依赖树):
-
-```sh
-cd crates/syncode-ui && cargo run
+cargo run -p syncode-cli -- "你的任务…"        # 跑指定任务
+cargo run -p syncode-cli                       # 跑一个内置 demo 任务
+cargo run -p syncode-cli -- --no-sandbox "…"   # 关掉 OS 沙箱(逃生口,默认开)
 ```
 
 ## ⚙️ 配置 / Configuration
 
 | 项 | 值 |
 |---|---|
-| 环境变量 / Env | `DEEPSEEK_API_KEY`(必需;未设置则 CLI 直接退出) |
+| 环境变量 / Env | `DEEPSEEK_API_KEY`(必需) |
 | 模型 / Model | `deepseek-v4-pro` |
 | 入口 / Endpoint | `https://api.deepseek.com`(OpenAI 兼容) |
-| CLI 参数 / Flags | `--no-sandbox` 关闭 OS 沙箱;其余 argv 拼成任务 |
+| Harness 参数 | `syncode-cli --no-sandbox` 关闭 OS 沙箱;其余 argv 拼成任务(仅 harness) |
 
 审批器 / 写收容 / 工具 cwd 全部由**同一个** `project_root`(默认当前工作目录)驱动,保证授权范围与收容范围不会漂移。
 
@@ -151,7 +140,7 @@ SynCode 默认**开启** OS 沙箱,并坚持「能安全收紧才敢放权」。
 - context 压缩:滚动 N-turn 窗口 · 工具结果存根 · CoT 回收 · LLM 摘要兜底(确定性、保护 prompt cache 前缀)
 - 13 个进程内工具 + 进程内 LSP / tree-sitter 语义层
 - 审批闸 + cap-std 写收容 + macOS Seatbelt 写沙箱(默认开)
-- SQLite 会话持久化与 resume;gpui 桌面 UI(流式 / 审批 / 取消修复 / resume)
+- **桌面应用(gpui)= 唯一界面**:流式输出 · 交互式审批 · Stop 取消修复 · 按 workspace 的 SQLite 持久化 / resume
 
 **路线图 / Roadmap**
 

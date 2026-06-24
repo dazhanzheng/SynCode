@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "SynCode headless 任务驱动入口 (二进制 syncode)。"
+description = "SynCode headless 开发/评测 harness (驱动 run_turn 跑真 DeepSeek)。非发布接口 — 唯一面向用户的界面是 syncode-ui (gpui)。"
 
 [[bin]]
 name = "syncode"

@@ -18,6 +18,7 @@ SynCode = **纯 Rust、自建**的 AI coding agent。核心押注：**DeepSeek v
 - **激进优先**：高风险 / 低回报的方向**保留在册并打标**，不提前删除。
 - **智识诚实，反方意见留档**：Rust **不**抬高**权限**天花板（那由 OS 决定）；真正的天花板是**模型 + 工具设计 + context 压缩质量**；per-call 性能基本无关紧要（被 LLM 延迟淹没）。选 Rust 是为了：context 完全掌控、in-process 语义红利、让激进授权变安全的安全底座、以及单语言 / 单二进制的长期一致性——**不是因为「Rust 快」**。
 - **平台**：macOS / Windows / Linux 桌面；移动端仅作驱动远程 agent 的瘦客户端（将来）。
+- **界面**：唯一面向用户的 interface 是 **gpui 桌面应用**（`syncode-ui`）；**不提供 CLI 产品**。`syncode-cli` 仅作 headless 开发 / 评测 harness（不构建 gpui 也能对 DeepSeek 跑真的 `run_turn`），非发布接口。
 - **借鉴策略**：从 `claude-code-main/` 吸取工具**设计 IP**（契约、写给模型读的 error message），用 Rust 重写并升级——不沿用其语言 / 实现。
 - **Bash 永远是万能逃生口**；below-shell 工具只在「跨边界真回本」处外科手术式加入。
 
@@ -28,4 +29,4 @@ SynCode = **纯 Rust、自建**的 AI coding agent。核心押注：**DeepSeek v
   - `private-docs/架构与工具策略.md` —— **架构与工具策略的权威源**（选型、上限评级、五类 agent→系统交互机制、安全模型、决策记录 / 开放问题 / 待办）。
   - `private-docs/DeepSeek-API-使用指南.md` —— **DeepSeek API 行为与 context 裁切的权威源**（`reasoning_content` 回传规则、CoT token 回收、prompt cache 前缀等）。
 - **本 `CLAUDE.md`** = **只放高层纲领**。需要细节时**去 `private-docs/` 查权威源**，不要把细节抄进本文件（避免读到过时副本）。
-- **当前进度 / 状态**（早期可编译骨架、实现体多为 `todo!()`）与 crate 工作区结构以根 `README.md` 为准——**指向它，别在此复述**。
+- **当前进度 / 状态**（早期但**已可运行**：自建 loop + context 压缩 + 工具 + LSP/AST + macOS 沙箱均已实现并有测试，**0 个 `todo!()`**）与 crate 工作区结构以根 `README.md` 为准——**指向它，别在此复述**。
