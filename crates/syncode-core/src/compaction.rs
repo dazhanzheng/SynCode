@@ -116,7 +116,13 @@ pub fn assemble_with_summary(
     normalize_for_api(&w)
 }
 
-/// 把一段 messages 摊平成可读文本喂给摘要器 (角色 + 文本 + 工具调用/结果摘要; CoT 不入摘要输入)。
+/// 摘要器输入的字符上限 (评估 P1): 旧前缀很大时 flatten 也必须**有界**, 否则「兜底摘要」请求自身会因
+/// 输入超窗而 400 —— 即在它最该生效的场景失败。取远低于 1M 窗口的保守值, 给输出 + system 前缀留足。
+pub const MAX_SUMMARY_INPUT_CHARS: usize = 400_000;
+
+/// 把一段 messages 摊平成可读文本喂给摘要器 (角色 + 文本 + 工具调用; CoT 不入摘要输入)。
+/// **有界** (评估 P1): 单条内容超 [`MAX_RESULT_CHARS`] 先头尾截断, 摊平总量超 [`MAX_SUMMARY_INPUT_CHARS`]
+/// 再整体头尾截断, 保证摘要请求一定塞得进窗口 (旧前缀, 细节丢失可接受)。
 pub fn flatten_for_summary(msgs: &[Message]) -> String {
     let mut s = String::new();
     for m in msgs {
@@ -129,7 +135,12 @@ pub fn flatten_for_summary(msgs: &[Message]) -> String {
         s.push_str(&format!("\n[{role}]\n"));
         if let Some(c) = &m.content {
             if !c.trim().is_empty() {
-                s.push_str(c);
+                // 单条上限: 巨大 tool result 先头尾截断, 不让一条挤占整个预算。
+                if c.chars().count() > MAX_RESULT_CHARS {
+                    s.push_str(&truncate_middle(c, MAX_RESULT_CHARS));
+                } else {
+                    s.push_str(c);
+                }
                 s.push('\n');
             }
         }
@@ -139,7 +150,12 @@ pub fn flatten_for_summary(msgs: &[Message]) -> String {
             }
         }
     }
-    s
+    // 总量上限: 条数多时即便每条都不大也可能超窗 → 整体头尾截断, 保证一定能塞下。
+    if s.chars().count() > MAX_SUMMARY_INPUT_CHARS {
+        truncate_middle(&s, MAX_SUMMARY_INPUT_CHARS)
+    } else {
+        s
+    }
 }
 
 #[cfg(test)]
@@ -269,5 +285,31 @@ mod tests {
         let recent = wire.iter().rev().find(|m| m.role == Role::Tool);
         assert_eq!(recent.and_then(|m| m.content.clone()).as_deref(), Some("RESULT 7"));
         assert_eq!(normalize_for_api(&wire).len(), wire.len());
+    }
+
+    #[test]
+    fn flatten_for_summary_caps_single_huge_result() {
+        let log = vec![Message::user("u"), Message::tool_result("c", &"Z".repeat(2_000_000))];
+        let flat = flatten_for_summary(&log);
+        assert!(
+            flat.chars().count() <= MAX_SUMMARY_INPUT_CHARS + 1024,
+            "summary input must be bounded, got {}",
+            flat.chars().count()
+        );
+    }
+
+    #[test]
+    fn flatten_for_summary_caps_many_messages_total() {
+        let mut log = Vec::new();
+        for i in 0..6 {
+            log.push(Message::user(format!("u{i}")));
+            log.push(Message::tool_result(&format!("c{i}"), &"Z".repeat(150_000)));
+        }
+        let flat = flatten_for_summary(&log);
+        assert!(
+            flat.chars().count() <= MAX_SUMMARY_INPUT_CHARS + 1024,
+            "total summary input must be bounded, got {}",
+            flat.chars().count()
+        );
     }
 }

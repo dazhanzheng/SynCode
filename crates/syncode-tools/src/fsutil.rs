@@ -66,6 +66,13 @@ fn decode_text(bytes: &[u8]) -> String {
     }
 }
 
+/// 二进制嗅探: 解码文本前 ~8KB 内出现 NUL(U+0000)即判为二进制 (对照 git / ripgrep 的 NUL 启发式)。
+/// `from_utf8_lossy` 会保留合法 NUL 字节, 故可直接在解码文本上判定, 无需重读字节。
+pub fn looks_binary(content: &str) -> bool {
+    const SNIFF_CHARS: usize = 8192;
+    content.chars().take(SNIFF_CHARS).any(|c| c == '\0')
+}
+
 /// 文件原本是否用 CRLF 换行 (任一处 `\r\n` 即判 CRLF)。用于 Edit 写回时保留原换行风格,
 /// 避免在 Windows 上把整文件的 CRLF 改成 LF (CC 行为: Edit 保留原 EOL)。
 pub fn file_is_crlf(path: &Path) -> bool {
@@ -101,4 +108,15 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_binary_detects_nul_but_not_unicode_text() {
+        assert!(looks_binary("abc\0def"));
+        assert!(!looks_binary("plain\ntext, no nul, just unicode: 你好 😀"));
+    }
 }
