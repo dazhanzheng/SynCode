@@ -4,6 +4,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# gpui UI spike 自成独立 workspace (见其 Cargo.toml), 隔离 gpui 巨依赖树, 不污染主构建。
+exclude = ["crates/syncode-ui"]
 
 [workspace.package]
 version = "0.0.0"
@@ -22,12 +24,27 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 # reqwest: 保留默认 TLS (Windows 走 SChannel, 无需 C 编译器), 仅加 json + stream。
 reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+# 文件工具底层 (§5 第一梯队: 原子写 / 库化 ripgrep)。
+tempfile = "3"
+ignore = "0.4"
+regex = "1"
+# 标准正确的 file:// URI 编解码 (LSP path<->uri 两侧一致, 否则 Windows 上诊断键对不上)。
+url = "2"
+# Windows Job Object (沙箱底座: 杀整进程树 + 资源硬限, §7.4)。
+windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation"] }
+# Unix 进程组 killpg (沙箱底座: Job Object 在 POSIX 的对位, 杀整进程树)。
+libc = "0.2"
+# rusqlite bundled: 自带 SQLite C 源, 编进二进制 (单文件持久化, D2/D4 event-log/checkpoint)。
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # 内部 crate (路径依赖, 供成员用 { workspace = true } 引用)
 syncode-llm = { path = "crates/syncode-llm" }
 syncode-core = { path = "crates/syncode-core" }
 syncode-tools = { path = "crates/syncode-tools" }
 syncode-sandbox = { path = "crates/syncode-sandbox" }
+syncode-ast = { path = "crates/syncode-ast" }
+syncode-lsp = { path = "crates/syncode-lsp" }
 
 [profile.dev]
 # 骨架期默认即可。

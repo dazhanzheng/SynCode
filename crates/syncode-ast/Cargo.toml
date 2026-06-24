@@ -1,0 +1,14 @@
+[package]
+name = "syncode-ast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SynCode AST 引擎 (架构 §4): tree-sitter + ast-grep 驱动的结构化搜索/改写/语法校验。被工具层与将来的语义层复用。"
+
+[dependencies]
+ast-grep-core = "0.43.0"
+ast-grep-language = "0.43.0"
+thiserror = { workspace = true }
+
+[dev-dependencies]

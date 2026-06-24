@@ -10,3 +10,19 @@ description = "SynCode 内置工具 (借鉴 CC 工具设计 IP, 用 Rust 重写,
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 syncode-core = { workspace = true }
+syncode-ast = { workspace = true }
+syncode-lsp = { workspace = true }
+syncode-sandbox = { workspace = true }
+tempfile = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
+# 编辑类工具 (Edit/Write/AstEdit) 产 unified diff 供 UI diff 视图。
+similar = "2"
+# code-as-action: 嵌入式脚本 VM (支柱 3)。Script 工具把多步 file 操作压成一段进程内脚本。
+# `sync`: 让 Engine/值 用 Arc 而非 Rc → Send+Sync, 可在 async (多线程 tokio) 上下文里安全使用。
+rhai = { version = "1", features = ["sync"] }
+# Lsp 工具用 tokio::time (诊断推送等待); 异步本身经 async-trait。
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

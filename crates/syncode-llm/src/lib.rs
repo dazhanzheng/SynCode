@@ -7,13 +7,13 @@
 //! 权威行为源: 内部的 DeepSeek API 使用指南 (未公开)。本 crate 把该文档里散落的行为约束
 //! (§7.4/§7.5 的 reasoning_content 回传规则、§12 前缀缓存、keep-alive、
 //! finish_reason 怪癖、错误重试分类) 编码成类型与函数, 让规则由类型系统兜底。
-//!
-//! 当前为骨架: 类型与签名立起来, 网络/解析逻辑为 `todo!()`。
 #![allow(dead_code, unused_variables)]
 
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod eval;
+pub mod stream;
 pub mod wire;
 
 pub use client::{DeepSeekClient, DeepSeekConfig};

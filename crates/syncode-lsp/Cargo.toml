@@ -1,0 +1,16 @@
+[package]
+name = "syncode-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SynCode 进程内 LSP 客户端 (架构 §4 代码智能 / §6.2 机制③): 常驻语言服务器 + 手写 JSON-RPC, 拿真语义事实。"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
