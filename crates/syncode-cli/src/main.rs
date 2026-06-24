@@ -1,4 +1,7 @@
-//! SynCode CLI — task-driven headless entrypoint.
+//! SynCode headless dev/eval harness — **非发布接口**。
+//!
+//! 唯一面向用户的界面是 `syncode-ui` (gpui 桌面应用); 本 crate 仅供开发 / 评测: 不构建 gpui 也能
+//! 对 DeepSeek 跑一个真的 `run_turn`, 验证 agent loop / 工具 / 压缩。
 //!
 //! 给一个任务 (argv 或默认), 在当前工作区跑一个 agent turn (内部多轮 tool-call 直到收尾),
 //! 然后落 transcript + token 统计。审批器 (PolicyApprover) / 写收容 (FsScope) / 工具 cwd 全用同一个
