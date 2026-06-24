@@ -1,6 +1,6 @@
 # SynCode workspace.
 # 设计依据见内部架构文档 (未公开): 纯 Rust core + 所有工具 Rust + 自建 agent loop + DeepSeek。
-# 当前为「可编译骨架」: 结构 / 类型 / trait / stub 立起来, 实现随后填 (todo!())。
+# 当前: 自建 agent loop + context 压缩 + 13 个进程内工具 + 进程内 LSP/AST + macOS Seatbelt 沙箱均已实现并有测试 (0 个 todo!())。详见根 README。
 [workspace]
 resolver = "3"
 members = ["crates/*"]

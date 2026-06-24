@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "SynCode headless 装配入口 (骨架)。"
+description = "SynCode headless 任务驱动入口 (二进制 syncode)。"
 
 [[bin]]
 name = "syncode"
