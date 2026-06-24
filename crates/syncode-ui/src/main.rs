@@ -41,6 +41,10 @@ mod color {
     pub fn green() -> Hsla { rgb(0x3fb950).into() }
     /// Red — danger / error / diff-del
     pub fn red() -> Hsla { rgb(0xf85149).into() }
+    /// Claude Code 暗色主题 diff 增行底色 (theme.ts 暗色档 diffAdded = rgb(34,92,43)) — 整行暗绿底
+    pub fn diff_add_bg() -> Hsla { rgb(0x225c2b).into() }
+    /// Claude Code 暗色主题 diff 删行底色 (diffRemoved = rgb(122,41,54)) — 整行暗红底
+    pub fn diff_del_bg() -> Hsla { rgb(0x7a2936).into() }
     /// Amber — warning / approval / reasoning
     pub fn amber() -> Hsla { rgb(0xd29922).into() }
     /// Card background for user messages (subtle blue tint)
@@ -900,21 +904,29 @@ impl AgentApp {
 
         let mut col = v_flex().gap_1().child(header);
         if expanded {
+            // Claude Code 暗色档配色: 增/删行**整行背景着色** (暗绿/暗红, 边到边), 文本走前景保证可读;
+            // hunk 头蓝、文件头/上下文走 muted。比「只染 +/- 文字」更接近 CC 的 diff 观感。
             let rows: Vec<AnyElement> = text
                 .lines()
                 .map(|l| {
-                    let color: Hsla = if l.starts_with("+++") || l.starts_with("---") {
-                        theme.muted_foreground
-                    } else if l.starts_with('@') {
-                        color::blue() // hunk 头
-                    } else if l.starts_with('+') {
-                        color::green() // 增
-                    } else if l.starts_with('-') {
-                        color::red() // 删
-                    } else {
-                        theme.muted_foreground // 上下文
-                    };
-                    div().text_xs().text_color(color).child(l.to_string()).into_any_element()
+                    let (bg, fg): (Option<Hsla>, Hsla) =
+                        if l.starts_with("+++") || l.starts_with("---") {
+                            (None, theme.muted_foreground) // 文件头
+                        } else if l.starts_with('@') {
+                            (None, color::blue()) // hunk 头
+                        } else if l.starts_with('+') {
+                            (Some(color::diff_add_bg()), theme.foreground) // 增
+                        } else if l.starts_with('-') {
+                            (Some(color::diff_del_bg()), theme.foreground) // 删
+                        } else {
+                            (None, theme.muted_foreground) // 上下文
+                        };
+                    let mut row =
+                        div().w_full().px_3().text_xs().text_color(fg).child(l.to_string());
+                    if let Some(b) = bg {
+                        row = row.bg(b);
+                    }
+                    row.into_any_element()
                 })
                 .collect();
             col = col.child(
@@ -923,11 +935,12 @@ impl AgentApp {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_expanded(i, cx)))
                     .ml(px(20.))
-                    .p_3()
+                    .py_2()
                     .rounded(px(8.))
                     .bg(color::surface())
                     .border_1()
                     .border_color(theme.border)
+                    .overflow_hidden()
                     .font_family(cx.theme().mono_font_family.clone())
                     .children(rows),
             );
