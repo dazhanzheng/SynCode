@@ -120,6 +120,9 @@ pub struct ToolCtx {
     /// 子 agent 派生器 (§5 编排)。`None` = 此上下文不允许派子 agent (子 agent 内部即如此 → 深度 1)。
     /// 由 `AgentLoop` 在启用 sub-agents 时注入。
     pub sub_agent: Option<SubAgentSpawner>,
+    /// 是否给 Bash spawn 的命令施加 OS 内核沙箱 (当前: macOS Seatbelt 写收容; 其它平台暂为 no-op)。
+    /// 由 `AgentLoop` 注入 (默认开, 安全优先); 直建的 ToolCtx (测试 / standalone) 默认关, 保持旧行为。
+    pub sandbox: bool,
 }
 
 impl ToolCtx {
@@ -139,6 +142,7 @@ impl ToolCtx {
             fs: None,
             background: Arc::new(BackgroundRegistry::new()),
             sub_agent: None,
+            sandbox: false,
         }
     }
 

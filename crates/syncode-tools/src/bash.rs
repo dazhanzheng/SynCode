@@ -117,6 +117,11 @@ impl Tool for BashTool {
             .get("max_memory_mb")
             .and_then(Value::as_u64)
             .map(|mb| mb.saturating_mul(1024 * 1024));
+        // 给 spawn 的命令施加 macOS Seatbelt 内核级写收容。来源: `ctx.sandbox` (AgentLoop 注入, 默认开)
+        // 或内部约定键 `"sandbox"` (不进 JSON schema、不暴露给模型; 供测试 / 显式调用)。Linux landlock 对位待接。
+        let sandbox = ctx.sandbox || args.get("sandbox").and_then(Value::as_bool).unwrap_or(false);
+        #[cfg(not(target_os = "macos"))]
+        let _ = sandbox;
 
         let mut cmd = shell_command(command, shell)?;
         cmd.current_dir(&ctx.cwd);
@@ -128,14 +133,39 @@ impl Tool for BashTool {
         // Unix: 让子进程自成进程组组长, 供超时时 killpg 杀整组 (Windows 走 Job Object, 无此调用)。
         #[cfg(unix)]
         cmd.process_group(0);
-        // Unix 内存硬限: 在子进程 (pre-exec) 里 setrlimit(RLIMIT_AS) —— 仅 max_memory 给定时生效。
-        // ⚠️ eyeball-only (tools crate 因 tree-sitter C 依赖无法 cross-check), 运行时待真机验。
+        // Unix 子进程 (post-fork, pre-exec) 硬限: setrlimit(RLIMIT_AS, 仅 Linux 且给定 max_memory 时) +
+        // macOS Seatbelt 写收容 (opt-in)。Seatbelt 走「fork 前编译、子进程 apply」的切分以保 async-signal-safe。
         #[cfg(unix)]
         {
             let mem = max_memory_bytes;
-            // SAFETY: apply_rlimits 只调 async-signal-safe 的 setrlimit, 在 pre_exec 钩子里安全。
+            // macOS: opt-in 时在 fork 前把 profile 编好 (写根 = cwd + 临时目录, 读放开, 网络放开 ——
+            // 网络由审批器另行把关), 子进程 pre_exec 里只 apply 已编译 profile。compile 失败 → 中止 spawn
+            // (要的沙箱建不起来 = fail closed, 不裸跑)。
+            #[cfg(target_os = "macos")]
+            let compiled = if sandbox {
+                let policy = syncode_sandbox::Policy {
+                    write_roots: sandbox_write_roots(&ctx.cwd),
+                    allow_network: true,
+                    ..Default::default()
+                };
+                Some(
+                    syncode_sandbox::macos::MacosSandbox::compile(&policy)
+                        .map_err(|e| ToolError::Exec(format!("seatbelt compile failed: {e}")))?,
+                )
+            } else {
+                None
+            };
+            // SAFETY: pre_exec 钩子里只做 async-signal-safe 的系统调用 —— setrlimit, 及装载已编译的
+            // Seatbelt profile (sandbox_apply, 不编译/不分配)。
             unsafe {
-                cmd.pre_exec(move || syncode_sandbox::apply_rlimits(mem));
+                cmd.pre_exec(move || {
+                    syncode_sandbox::apply_rlimits(mem)?;
+                    #[cfg(target_os = "macos")]
+                    if let Some(ref c) = compiled {
+                        c.apply_in_child()?;
+                    }
+                    Ok(())
+                });
             }
         }
 
@@ -321,6 +351,25 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(mut r: R, task: &BackgroundTask) 
             Ok(n) => task.append(&String::from_utf8_lossy(&buf[..n]), MAX_BG_OUTPUT),
         }
     }
+}
+
+/// 沙箱写根: 工作区 + 系统临时目录 + 构建工具的缓存/锁目录 (CARGO_HOME/`~/.cargo`、RUSTUP_HOME/`~/.rustup`)。
+/// 后两者必须放开 —— 否则沙箱里的 `cargo build`/`test` 会因写不了 `~/.cargo` 的 registry 缓存与
+/// `.package-cache` 锁而失败。这样既保住 Rust 工作流, 又仍挡住对用户其它文件 (`~/.ssh`、`~/Documents`…) 的写。
+#[cfg(target_os = "macos")]
+fn sandbox_write_roots(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut roots = vec![cwd.to_path_buf(), std::env::temp_dir()];
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cargo = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+    let rustup = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".rustup")));
+    roots.extend(cargo);
+    roots.extend(rustup);
+    roots
 }
 
 /// 默认收紧子进程 env (§7.1 默认收紧、显式放开): 清空后只回填「shell 能起来 + 跑得了构建」的必需项,

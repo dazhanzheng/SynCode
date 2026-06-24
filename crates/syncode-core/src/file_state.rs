@@ -111,11 +111,17 @@ impl FileStateCache {
     }
 }
 
-/// 规范化为绝对路径 key: `std::path::absolute` + 在 Windows 折叠 `\`→`/`, 使 Read 与随后的
+/// 规范化为绝对路径 key: `std::path::absolute` + 折叠 `\`→`/`, 使 Read 与随后的
 /// Edit (即便路径写法不同) 命中同一条目。(lexical `..` 解析与 symlink canonicalize = 未来 TODO。)
+///
+/// 大小写不敏感的文件系统 (Windows / 默认 APFS 的 macOS) 上还折叠大小写: 否则 `Read /Proj/Main.rs`
+/// 与随后 `Edit /proj/main.rs` 会落成两条不同条目, 令本缓存的「必先读」+ stale 检测 (整个缓存的存在理由)
+/// 静默失效。缓存是优化而非安全边界, 故 ASCII 折叠这一启发式可接受 (APFS 亦可建成大小写敏感, 属少数)。
 fn normalize(path: &Path) -> PathBuf {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    PathBuf::from(abs.to_string_lossy().replace('\\', "/"))
+    let s = abs.to_string_lossy().replace('\\', "/");
+    let s = if cfg!(any(windows, target_os = "macos")) { s.to_ascii_lowercase() } else { s };
+    PathBuf::from(s)
 }
 
 #[cfg(test)]

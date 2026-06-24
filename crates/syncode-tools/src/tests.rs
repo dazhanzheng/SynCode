@@ -501,6 +501,127 @@ async fn bash_scrubs_parent_env_keeps_essentials() {
     assert!(!out2.content.contains("%PATH%"), "PATH should be allowlisted: {}", out2.content);
 }
 
+// ---- Bash 执行路径的 Unix/macOS 覆盖 (此前全是 cfg(windows), Darwin 这条路从没自动化测过) ----
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_timeout_kills_the_process_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("gc.pid");
+    let ctx = ctx();
+    // sh 后台起一个 sleep 30 (孙进程, 非交互 shell 下与 sh 同进程组), 记录其 pid, 然后 wait 阻塞
+    // → 必触发 500ms 超时。容器超时走 killpg(pgid, SIGKILL) 杀整组: 若只杀直接子进程 (sh) 漏掉
+    // 孙进程 sleep, 本测试会抓到泄漏 (sleep 仍存活)。
+    let cmd = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+    let out = BashTool.call(json!({ "command": cmd, "timeout_ms": 500 }), &ctx).await.unwrap();
+    assert!(out.content.contains("timed out"), "should time out: {}", out.content);
+
+    let pid = std::fs::read_to_string(&pidfile).unwrap_or_default().trim().to_string();
+    assert!(!pid.is_empty(), "grandchild pid was not recorded");
+    // killpg 后孙进程被 SIGKILL 并由 launchd/init 回收 → `kill -0` 失败 (ESRCH)。给点时间轮询。
+    let mut alive = true;
+    for _ in 0..40 {
+        let st = std::process::Command::new("kill").arg("-0").arg(&pid).output().unwrap();
+        if !st.status.success() {
+            alive = false;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!alive, "grandchild sleep (pid {pid}) survived timeout → process tree not killed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_scrubs_parent_env_keeps_essentials() {
+    let ctx = ctx();
+    // cargo 跑测试时在父进程 env 注入 CARGO_MANIFEST_DIR (不在 scrub 白名单) → 子进程必须拿不到。
+    // (用它而非 set_var: 多线程下 set_var 在 2024 edition 不安全且会与其它测试竞争。)
+    let out = BashTool
+        .call(json!({ "command": "printf 'manifest=[%s]' \"$CARGO_MANIFEST_DIR\"" }), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.contains("manifest=[]"), "non-allowlisted env not scrubbed: {}", out.content);
+    // PATH 在白名单 → 回填 → 非空, 不应输出 path=[]。
+    let out2 = BashTool
+        .call(json!({ "command": "printf 'path=[%s]' \"$PATH\"" }), &ctx)
+        .await
+        .unwrap();
+    assert!(!out2.content.contains("path=[]"), "PATH should be allowlisted: {}", out2.content);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "invokes rustc; slow; verifies the scrubbed env can still build Rust on macOS"]
+async fn bash_can_compile_and_run_rust_under_scrubbed_env() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hello.rs"),
+        "fn main() { let s: i32 = (1..=10).sum(); println!(\"sum={s}\"); }",
+    )
+    .unwrap();
+    let ctx = ToolCtx::new(Arc::new(FileStateCache::new()), dir.path().to_path_buf());
+    // 关键: env 被 scrub 后, rustc 还能靠白名单里的 CARGO_HOME/RUSTUP_HOME 找到工具链并编译+运行?
+    let out = BashTool
+        .call(json!({ "command": "rustc hello.rs -o hello && ./hello", "timeout_ms": 120000 }), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.contains("sum=55"), "build/run under scrubbed env failed:\n{}", out.content);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn bash_seatbelt_confines_writes_to_workspace() {
+    // 端到端验证 Seatbelt 接进 Bash 路径 (opt-in "sandbox":true): fork 前编译 profile, 子进程 pre_exec 装载。
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ToolCtx::new(Arc::new(FileStateCache::new()), dir.path().to_path_buf());
+
+    // cwd 内写 → 放行 (Seatbelt 写根 = cwd + tmpdir)。
+    let inside = dir.path().join("ok.txt");
+    let out = BashTool
+        .call(json!({ "command": format!("echo hi > '{}'", inside.display()), "sandbox": true }), &ctx)
+        .await
+        .unwrap();
+    assert!(inside.exists(), "in-cwd sandboxed write should land: {}", out.content);
+
+    // 写根外 (HOME 下, 不在 cwd/tmpdir) → Seatbelt 内核层拒, 不落盘。
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let outside = std::path::PathBuf::from(home).join(".syncode_seatbelt_ESCAPE.txt");
+    let _ = std::fs::remove_file(&outside);
+    let out = BashTool
+        .call(json!({ "command": format!("echo evil > '{}'", outside.display()), "sandbox": true }), &ctx)
+        .await
+        .unwrap();
+    let escaped = outside.exists();
+    let _ = std::fs::remove_file(&outside);
+    assert!(!escaped, "sandboxed out-of-root write must be kernel-denied: {}", out.content);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "slow; runs cargo build under Seatbelt to verify the default sandbox doesn't break Rust builds"]
+async fn bash_sandbox_allows_cargo_build() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"sbx\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"sbx\"\npath = \"main.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() { println!(\"ok\"); }").unwrap();
+    let ctx = ToolCtx::new(Arc::new(FileStateCache::new()), dir.path().to_path_buf());
+    // 沙箱写根含 cwd + ~/.cargo + ~/.rustup, 故 cargo 能写 target/ 与 registry 缓存 / .package-cache 锁。
+    // 若写根少了构建缓存, cargo 会在沙箱里失败 —— 本测试正是守这条默认策略。
+    let out = BashTool
+        .call(json!({ "command": "cargo build 2>&1", "sandbox": true, "timeout_ms": 180000 }), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out.content.contains("Finished") || out.content.contains("Compiling sbx"),
+        "cargo build under sandbox failed (build-cache write blocked?):\n{}",
+        out.content
+    );
+}
+
 #[tokio::test]
 async fn glob_lists_files_respecting_gitignore_and_pattern() {
     let dir = tempfile::tempdir().unwrap();

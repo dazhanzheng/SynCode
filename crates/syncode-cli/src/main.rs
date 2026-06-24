@@ -38,16 +38,28 @@ async fn main() {
     println!("workspace: {}", project_root.display());
     println!("tools: {:?}", registry.names());
 
+    // 解析 argv: `--no-sandbox` 关掉 OS 沙箱 (逃生口, 默认开); 其余拼成任务。
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let no_sandbox = raw.iter().any(|a| a == "--no-sandbox");
+    let task: String = {
+        let rest: Vec<&str> = raw.iter().map(String::as_str).filter(|a| *a != "--no-sandbox").collect();
+        if rest.is_empty() { DEFAULT_TASK.to_string() } else { rest.join(" ") }
+    };
+    println!(
+        "sandbox: {}",
+        if no_sandbox {
+            "off (--no-sandbox)"
+        } else {
+            "on (macOS Seatbelt; writes confined to workspace + build caches)"
+        }
+    );
+
     let mut agent = AgentLoop::new(Arc::new(client), registry)
         .with_approver(Arc::new(PolicyApprover::new(&project_root)))
         .with_fs_scope(Some(Arc::new(FsScope::new(&project_root))))
         .with_cwd(&project_root)
-        .with_sub_agents(true); // 顶层启用子 agent 派生 (子 agent 内部恒禁用, 深度 1)
-
-    let task: String = {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.is_empty() { DEFAULT_TASK.to_string() } else { args.join(" ") }
-    };
+        .with_sub_agents(true) // 顶层启用子 agent 派生 (子 agent 内部恒禁用, 深度 1)
+        .with_sandbox(!no_sandbox);
 
     let mut session = Session::with_system(syncode_core::system_prompt(&project_root));
     session.push_user(&task);
