@@ -18,17 +18,19 @@ use crate::fs_scope::SharedFsScope;
 use crate::permission::{AllowAll, Approver, Decision};
 use crate::registry::ToolRegistry;
 use crate::session::Session;
-use crate::state::SessionStore;
+use crate::state::{title_snippet, SessionMeta, SessionStore};
 use crate::tool::{SubAgentRequest, SubAgentSpawner, TodoItem, ToolCtx};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use syncode_lsp::LspManager;
 use syncode_llm::client::{DeepSeekClient, MODEL};
 use syncode_llm::stream::ChatStreamChunk;
 use syncode_llm::wire::{
-    ChatRequest, FinishReason, FunctionCall, Message, ReasoningEffort, Thinking, ThinkingType,
+    ChatRequest, FinishReason, FunctionCall, Message, ReasoningEffort, Role, Thinking, ThinkingType,
     ToolCall,
 };
 
@@ -119,6 +121,8 @@ pub struct AgentLoop {
     /// 可选持久化 (D2/D4)。无则纯内存。
     store: Option<SessionStore>,
     session_id: String,
+    /// 工作区标识 (一个 workspace 下可有多条会话; 列表/新建按它分组)。
+    workspace: String,
     /// 自动压缩预算 (支柱 1): 决定 soft/hard 阈值。
     budget: Budget,
     /// 上一轮 server 回传的精确 prompt_tokens (用于「连窗口都太大」的摘要高水位判断)。
@@ -134,6 +138,18 @@ pub struct AgentLoop {
     /// 是否给 Bash spawn 的命令施加 OS 内核沙箱 (默认开, 安全优先; macOS Seatbelt 写收容, 其它平台 no-op)。
     /// [`with_sandbox(false)`](Self::with_sandbox) 关闭 (逃生口)。子 agent 继承父设置 (权限不放宽)。
     sandbox: bool,
+}
+
+/// 毫秒时钟 (会话元数据时间戳)。
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
+/// 生成唯一、时间可排序的 session id (now_ms + 进程内自增, 防同毫秒撞)。
+fn new_session_id(now_ms: i64) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("sess-{now_ms:013}-{n:04}")
 }
 
 impl AgentLoop {
@@ -152,6 +168,7 @@ impl AgentLoop {
             ask_gate: None,
             store: None,
             session_id: "default".to_string(),
+            workspace: String::new(),
             budget: Budget::default(),
             last_prompt_tokens: None,
             summary_msg: None,
@@ -270,11 +287,56 @@ impl AgentLoop {
         self
     }
 
-    /// 挂上持久化: 每条消息落库 + turn 起点打 checkpoint (D2/D4)。
-    pub fn with_store(mut self, store: SessionStore, session_id: impl Into<String>) -> Self {
+    /// 挂上持久化 (D2/D4): 每条消息落库 + turn 起点打 checkpoint。第二参是**工作区标识** (一个 workspace
+    /// 下可有多条会话)。自动迁移旧库, 并续上该 workspace 最近一条会话 (无则新建一条)。
+    pub fn with_store(mut self, store: SessionStore, workspace: impl Into<String>) -> Self {
+        let ws = workspace.into();
+        let now = now_ms();
+        let _ = store.backfill_sessions(now);
+        let sid = store
+            .list_sessions(&ws)
+            .ok()
+            .and_then(|mut v| v.drain(..).next().map(|m| m.session_id))
+            .unwrap_or_else(|| {
+                let id = new_session_id(now);
+                let _ = store.ensure_session(&id, &ws, now);
+                id
+            });
+        self.workspace = ws;
+        self.session_id = sid;
         self.store = Some(store);
-        self.session_id = session_id.into();
         self
+    }
+
+    /// 当前 workspace 下的会话列表 (最近活跃在前)。无 store → 空。
+    pub fn sessions(&self) -> Vec<SessionMeta> {
+        self.store.as_ref().and_then(|s| s.list_sessions(&self.workspace).ok()).unwrap_or_default()
+    }
+
+    /// 当前会话 id。
+    pub fn current_session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// 切到某条已存在会话 (随后调用 [`resume_session`](Self::resume_session) 重建内存)。
+    /// 同时清掉上一会话的摘要态, 防投影串味。
+    pub fn switch_session(&mut self, session_id: impl Into<String>) {
+        self.session_id = session_id.into();
+        self.summary_msg = None;
+        self.compaction_boundary = None;
+        self.summarize_fails = 0;
+        self.last_prompt_tokens = None;
+    }
+
+    /// 新开一条会话 (**不删旧的**): 生成新 id、登记元数据、设为当前。返回新 id。
+    pub fn start_new_session(&mut self) -> String {
+        let now = now_ms();
+        let sid = new_session_id(now);
+        if let Some(store) = &self.store {
+            let _ = store.ensure_session(&sid, &self.workspace, now);
+        }
+        self.switch_session(sid.clone());
+        sid
     }
 
     pub fn tools(&self) -> &ToolRegistry {
@@ -291,7 +353,7 @@ impl AgentLoop {
         }
     }
 
-    /// 清空持久化的当前会话 (New chat: 删掉该 session_id 的全部事件)。无 store 时 no-op。
+    /// 删掉当前 session 的全部事件 (显式删除会话用; New chat 改走 start_new_session, 不删旧的)。无 store 时 no-op。
     pub fn reset_store(&self) {
         if let Some(store) = &self.store {
             let _ = store.rollback(&self.session_id, -1); // 删 seq > -1 = 全部
@@ -416,6 +478,16 @@ impl AgentLoop {
             }
         }
         let _ = store.checkpoint(&self.session_id, "turn");
+        // 会话元数据: 更新活跃时间 + (首次) 用首条 user 消息作列表标题。
+        let _ = store.touch_session(&self.session_id, now_ms());
+        if let Some(c) = session
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::User)
+            .and_then(|m| m.content.as_deref())
+        {
+            let _ = store.set_title_if_absent(&self.session_id, &title_snippet(c));
+        }
     }
 
     /// 跑一个完整 turn 直到模型给出非 `ToolCalls`(且非 leaked tool-call)的 `finish_reason`。
