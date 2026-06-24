@@ -120,14 +120,15 @@ pub struct PolicyApprover {
 impl PolicyApprover {
     /// `project_root` = 授权项目根 (通常 = 启动目录)。默认追加系统临时目录为写根。
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        let mut write_roots = vec![crate::pathutil::normalize(&project_root.into())];
-        write_roots.push(crate::pathutil::normalize(&std::env::temp_dir()));
+        let mut write_roots = Vec::new();
+        push_root_forms(&mut write_roots, project_root.into());
+        push_root_forms(&mut write_roots, std::env::temp_dir());
         Self { write_roots }
     }
 
     /// 追加一个写根 (如显式授权的额外目录)。
     pub fn with_write_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.write_roots.push(crate::pathutil::normalize(&root.into()));
+        push_root_forms(&mut self.write_roots, root.into());
         self
     }
 
@@ -139,6 +140,24 @@ impl PolicyApprover {
             None => true,
             Some(t) => crate::pathutil::within_any(&PathBuf::from(t), &self.write_roots),
         }
+    }
+}
+
+/// 把一个写根的**两种拼写**都登记进表: 词法归一值, 外加 canonicalize 后的值 (若存在且不同)。
+/// 这样无论目标路径以哪种拼写给来都判得一致 —— 关键场景: macOS 上 `std::env::temp_dir()` 返回
+/// `/var/folders/...`, 而 `/var` 是指向 `/private/var` 的符号链接, 故 [`FsScope`](crate::fs_scope) 持
+/// canonical 的 `/private/var/...`。若本审批器只存词法 `/var/...`, 一个已被 canonicalize 成
+/// `/private/var/...` 的目标就会对不上根 → 误判 `Ask` (本是授权 temp 内的写)。两种拼写都存即消除该分歧。
+fn push_root_forms(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    let lexical = crate::pathutil::normalize(&root);
+    if let Ok(canon) = root.canonicalize() {
+        let canon = crate::pathutil::normalize(&canon);
+        if canon != lexical && !roots.contains(&canon) {
+            roots.push(canon);
+        }
+    }
+    if !roots.contains(&lexical) {
+        roots.push(lexical);
     }
 }
 

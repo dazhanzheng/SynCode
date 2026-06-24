@@ -92,9 +92,14 @@ impl FsScope {
         self.check_writable(path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
 
-        // 找到包含该路径的根 + 根相对路径。
+        // 找到包含该路径的根 + 根相对路径。先按词法根算; 词法对不上时 (如 macOS 上目标以 canonical
+        // 的 `/private/var/...` 给来、而词法根是 `/var/...`) 退而用**真实路径 vs canonical 根**再算一次,
+        // 这样仍走该根的 cap-std `Dir` 句柄 (canon 根上打开的), 而非掉进下方无构造级收容的裸写兜底。
+        let real = resolve_real(&crate::pathutil::normalize(path));
         for r in &self.roots {
-            let Some(rel) = crate::pathutil::strip_within(path, &r.lexical) else {
+            let Some(rel) = crate::pathutil::strip_within(path, &r.lexical)
+                .or_else(|| crate::pathutil::strip_within(&real, &r.canon))
+            else {
                 continue;
             };
             if rel.as_os_str().is_empty() {
@@ -254,15 +259,17 @@ mod tests {
         use std::os::unix::fs::symlink;
         let base = std::env::temp_dir().join("syncode_fsscope_symlink_test");
         let root = base.join("root");
-        let outside = base.join("outside");
         let _ = std::fs::create_dir_all(&root);
-        let _ = std::fs::create_dir_all(&outside);
+        // 逃逸目标必须落在**所有**写根之外。⚠️ FsScope::new 会把 temp_dir() 也登记为写根, 故
+        // 不能拿 temp 内的目录当「根外」—— 它本就可写, 符号链接解析后合法、测不出逃逸。改用 temp 的
+        // 父目录: 真实存在、且既不在 root 内、也不在 temp 写根内 (沿用本文件其它测试的 above_temp 惯例)。
+        let Some(outside) = std::env::temp_dir().parent().map(|p| p.to_path_buf()) else { return };
         let link = root.join("escape");
         let _ = std::fs::remove_file(&link);
-        // root/escape -> outside (根内的符号链接指向根外)。
+        // root/escape -> <temp 之上> (根内的符号链接指向所有写根之外)。
         if symlink(&outside, &link).is_ok() {
             let scope = FsScope::new(&root);
-            // 词法上 root/escape/evil.txt 在根内, 但 canonicalize 后落到 outside → 必须被拒。
+            // 词法上 root/escape/evil.txt 在根内, 但 canonicalize 后落到写根外 → 必须被拒。
             assert!(scope.check_writable(&link.join("evil.txt")).is_err());
         }
     }

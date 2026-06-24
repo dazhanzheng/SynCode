@@ -1,3 +1,5 @@
 [toolchain]
 channel = "stable"
-targets = ["x86_64-pc-windows-msvc"]
+# 不在此预置交叉编译 target: rustup 默认用 host triple (本机开发 = aarch64-apple-darwin)。
+# 原先钉死的 x86_64-pc-windows-msvc 会让每台非 Windows 机器一进目录就去下一份用不上的 Windows std
+# (离线时 bootstrap 直接失败)。Windows CI 若需该 target, 在对应 job 内单独 `rustup target add x86_64-pc-windows-msvc`。

@@ -154,14 +154,18 @@ mod unix_backend {
 /// **Unix 资源硬限**: 在子进程 (post-fork, pre-exec) 里施加 `setrlimit` —— 给 [`std::os::unix::process::CommandExt::pre_exec`]
 /// 的闭包调用。`setrlimit` 是 async-signal-safe, 故可在 pre_exec 钩子里安全调用。
 ///
-/// 当前只设 `RLIMIT_AS` (虚拟地址空间上限, 约束「单进程内存吃爆」), 仅在 `max_memory_bytes = Some` 时生效。
+/// 当前只设 `RLIMIT_AS` (虚拟地址空间上限, 约束「单进程内存吃爆」), 且**仅 Linux** 施加。
 /// **进程数上限**故意不走 `RLIMIT_NPROC` —— 它是**按真实 uid** 全局计数的, 设低会误伤用户自己其它进程的
 /// fork, 危险; per-job 的进程数硬限需 cgroups v2 (路线图 P2, 待 Linux 真机)。Windows 侧用 Job Object 的
 /// `ActiveProcessLimit` (见 [`windows_backend`])。
 ///
-/// ⚠️ 仅 cross-target 编译验证, 运行时待真 Linux/macOS 验。
+/// ⚠️ macOS/Darwin: `setrlimit(RLIMIT_AS, 有限值)` 被 XNU 拒绝 (EINVAL), 且即便接受也因 dyld/libmalloc
+/// 预留巨量虚拟地址而形同虚设。**关键**: 本函数在 `pre_exec` 钩子里调用, 返回 `Err` 会中止 exec ——
+/// 故在非 Linux 上一律 **no-op**, 绝不把「内存上限未生效」升级成「命令根本起不来」。macOS 的真实内存
+/// 约束需另走 Seatbelt (见 [`macos`] backend, TODO)。
 #[cfg(unix)]
 pub fn apply_rlimits(max_memory_bytes: Option<u64>) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
     if let Some(bytes) = max_memory_bytes {
         let lim = libc::rlimit {
             rlim_cur: bytes as libc::rlim_t,
@@ -173,6 +177,9 @@ pub fn apply_rlimits(max_memory_bytes: Option<u64>) -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
     }
+    // 非 Linux unix (macOS 等): max_memory_bytes 不被强制 (见上)。消费掉参数避免未用告警。
+    #[cfg(not(target_os = "linux"))]
+    let _ = max_memory_bytes;
     Ok(())
 }
 

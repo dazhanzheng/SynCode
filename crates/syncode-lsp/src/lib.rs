@@ -610,11 +610,25 @@ mod tests {
             .unwrap_or_default()
     }
 
+    // Windows: 盘符大小写 + percent-encoded 空格应收敛到同一键。
+    // (C:/ 风格路径仅在 Windows 上被 url::from_file_path 视为绝对路径; 在 Unix 上它是相对路径、解析回退,
+    //  且盘符语义对 Unix 无意义 —— 故本断言 Windows-only, macOS 见下方 uri_key_normalizes_encoding。)
+    #[cfg(windows)]
     #[test]
     fn uri_key_normalizes_drive_case_and_encoding() {
         // 服务器风格 (小写盘符 + percent-encoded 空格) 与工具风格 (大写盘符 + 原始) 应收敛到同一键。
         let server = "file:///c:/Users/x/a%20b.rs";
         let tool = path_to_file_uri(Path::new("C:/Users/x/a b.rs"));
+        assert_eq!(uri_to_key(server), uri_to_key(&tool), "tool uri = {tool}");
+    }
+
+    // Unix/macOS: 无盘符概念, 但 percent-encoded 空格仍须让「服务器回传」与「工具构造」的 uri 收敛同键
+    // (诊断表键一致, 否则同一文件的诊断对不上)。用绝对 /Users 路径: from_file_path 在 Unix 上要求绝对路径。
+    #[cfg(unix)]
+    #[test]
+    fn uri_key_normalizes_encoding() {
+        let server = "file:///Users/x/a%20b.rs";
+        let tool = path_to_file_uri(Path::new("/Users/x/a b.rs"));
         assert_eq!(uri_to_key(server), uri_to_key(&tool), "tool uri = {tool}");
     }
 
