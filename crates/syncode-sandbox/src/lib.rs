@@ -412,7 +412,165 @@ pub mod linux {
     pub mod escape_tests {}
 }
 
+// 平台后端: macOS Seatbelt (sandbox_init + SBPL)。Linux 对位 = landlock+seccomp (见上)。
 #[cfg(target_os = "macos")]
 pub mod macos {
-    //! sandbox_init / Endpoint Security 后端 (TODO, §5.1)。
+    //! macOS 深度沙箱后端 (§4/§7, Linux landlock+seccomp 在 Darwin 的对位): Seatbelt `sandbox_init`
+    //! 配 SBPL 配置, 做**写收容** (让 `Policy.write_roots` 真正 load-bearing) + **网络拒绝**
+    //! (让 `allow_network=false` 在**内核层**生效, 而非靠 classifier)。无需 root。
+    //!
+    //! **设计 (与项目「读不收容、只管写+网络」一致)**: 配置从 `(allow default)` 起步再逐项收紧 ——
+    //! 而非 deny-default。Darwin 上 deny-default 会连 dyld / 系统库 / `/dev` 的读取都挡掉, 任何程序都
+    //! 起不来 (Seatbelt 与 landlock 不同, 读不放开就寸步难行)。故只 `(deny file-write*)` 后放开授权写根
+    //! 与 `/dev` 设备, 并按需 `(deny network*)`。读放开 (项目威胁模型: 外泄面是网络, 由网络拒绝兜)。
+    //!
+    //! **集成注意 (async-signal-safety)**: `sandbox_init` 会 malloc / 编译 SBPL, **非 async-signal-safe**,
+    //! 故**不**默认接进 Bash 的 `pre_exec` 路径 (与 Linux 后端同, 默认仍 [`NoopSandbox`])。要在
+    //! post-fork/pre-exec 施加, 需走「fork 前编译好配置 → 子进程仅做必要系统调用」的切分, 或用
+    //! `posix_spawn` + 包装二进制。当前把后端写出来 + **在本机用 `sandbox-exec` 实证**配置正确
+    //! (见 [`tests`]), 留待接入。
+    //!
+    //! `sandbox_init` 自 10.x 起标注 deprecated 但**至今可用** (Chromium / Bazel / sandbox-exec 在用);
+    //! libc 未导出, 故下方自声明 FFI。
+
+    use super::{Policy, Sandbox, SandboxError};
+    use std::ffi::{c_char, CStr, CString};
+    use std::path::Path;
+
+    // Seatbelt C API。`sandbox_init(profile, flags=0, &mut errbuf)`: 0=成功; -1=失败且 errbuf 被填,
+    // 须 `sandbox_free_error` 释放。flags=0 表示 profile 是 SBPL 字符串 (非具名内建)。
+    unsafe extern "C" {
+        fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
+        fn sandbox_free_error(errorbuf: *mut c_char);
+    }
+
+    /// Seatbelt 后端。`apply` 须在**目标进程自身**调用 (理想是子进程 post-fork、pre-exec);
+    /// `sandbox_init` 施加后**不可撤销**, 影响整个进程。
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct MacosSandbox;
+
+    impl Sandbox for MacosSandbox {
+        fn name(&self) -> &str {
+            "macos-seatbelt"
+        }
+
+        fn apply(&self, policy: &Policy) -> Result<(), SandboxError> {
+            let profile = compile_profile(policy);
+            let c = CString::new(profile)
+                .map_err(|e| SandboxError::Apply(format!("seatbelt: profile has interior NUL: {e}")))?;
+            let mut err: *mut c_char = std::ptr::null_mut();
+            // SAFETY: `c` 在调用期间存活; 失败时 `err` 指向 C 分配的串, 由 sandbox_free_error 释放。
+            let rc = unsafe { sandbox_init(c.as_ptr(), 0, &mut err) };
+            if rc != 0 {
+                let msg = if err.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    // SAFETY: sandbox_init 失败时 err 指向有效 C 串。
+                    let s = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
+                    unsafe { sandbox_free_error(err) };
+                    s
+                };
+                return Err(SandboxError::Apply(format!("sandbox_init failed: {msg}")));
+            }
+            Ok(())
+        }
+    }
+
+    /// 由 [`Policy`] 生成 SBPL 配置串。`pub` 供测试 (用 `sandbox-exec -p <profile>` 实证 Seatbelt 真收容)。
+    ///
+    /// 规则按「最后命中者胜」语义排布: 先 `(allow default)`, 再 `(deny file-write*)` 收掉所有写,
+    /// 再放开 `/dev` 设备 (null/tty/pty —— 否则 shell/编译器写不了 stdio) 与各授权写根 (canonicalize,
+    /// 解析 `/var`→`/private/var` 等符号链接, 与内核施加时的路径解析对齐), 最后按需 `(deny network*)`。
+    pub fn compile_profile(policy: &Policy) -> String {
+        let mut p = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+        p.push_str("(allow file-write*\n    (subpath \"/dev\")\n");
+        for root in &policy.write_roots {
+            let canon = root.canonicalize().unwrap_or_else(|_| root.clone());
+            p.push_str("    (subpath ");
+            p.push_str(&sbpl_string(&canon));
+            p.push_str(")\n");
+        }
+        p.push_str(")\n");
+        if !policy.allow_network {
+            p.push_str("(deny network*)\n");
+        }
+        p
+    }
+
+    /// 把路径编成 SBPL 字符串字面量 (双引号包裹, 转义 `\` 与 `"`)。
+    fn sbpl_string(path: &Path) -> String {
+        let s = path.to_string_lossy();
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '\\' || ch == '"' {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::process::Command;
+
+        /// 用系统的 `sandbox-exec`(同一 Seatbelt 引擎) 跑 `sh -c <cmd>`, 实证我们生成的配置。
+        fn run_sandboxed(profile: &str, sh_cmd: &str) -> std::process::Output {
+            Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(profile)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(sh_cmd)
+                .output()
+                .expect("spawn /usr/bin/sandbox-exec")
+        }
+
+        #[test]
+        fn profile_confines_writes_to_roots() {
+            let root = std::env::temp_dir().join("syncode_seatbelt_write_root");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let policy = Policy { write_roots: vec![root.clone()], ..Policy::default() };
+            let profile = compile_profile(&policy);
+
+            // 1. 写授权根内 → 成功 (Seatbelt 放行)。
+            let inside = root.join("ok.txt");
+            let out = run_sandboxed(&profile, &format!("echo hi > '{}'", inside.display()));
+            assert!(
+                out.status.success() && inside.exists(),
+                "in-root write must succeed; stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+
+            // 2. 写根外 (temp 根目录, 不在 write_roots) → 必须被**内核层**拒, 不落盘。
+            let outside = std::env::temp_dir().join("syncode_seatbelt_ESCAPE.txt");
+            let _ = std::fs::remove_file(&outside);
+            let out = run_sandboxed(&profile, &format!("echo evil > '{}'", outside.display()));
+            assert!(!out.status.success(), "out-of-root write must be denied by Seatbelt");
+            assert!(!outside.exists(), "denied write must not touch disk");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn profile_denies_network_when_disallowed() {
+            let policy = Policy { allow_network: false, ..Policy::default() };
+            let profile = compile_profile(&policy);
+            assert!(profile.contains("(deny network*)"), "profile must deny network");
+            // 连一个字面 IP (跳过 DNS), 短超时。deny network* 下 socket/connect 在内核层失败 → curl 非 0。
+            let out = run_sandboxed(&profile, "curl -sS --max-time 3 http://93.184.216.34/ >/dev/null");
+            assert!(!out.status.success(), "network must be denied under (deny network*)");
+        }
+
+        #[test]
+        fn profile_allows_network_when_permitted() {
+            // allow_network=true → 配置里不应有网络拒绝 (放行决策在更上层)。
+            let policy = Policy { allow_network: true, ..Policy::default() };
+            assert!(!compile_profile(&policy).contains("deny network"));
+        }
+    }
 }
