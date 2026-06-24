@@ -597,6 +597,31 @@ async fn bash_seatbelt_confines_writes_to_workspace() {
     assert!(!escaped, "sandboxed out-of-root write must be kernel-denied: {}", out.content);
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "slow; runs cargo build under Seatbelt to verify the default sandbox doesn't break Rust builds"]
+async fn bash_sandbox_allows_cargo_build() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"sbx\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"sbx\"\npath = \"main.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() { println!(\"ok\"); }").unwrap();
+    let ctx = ToolCtx::new(Arc::new(FileStateCache::new()), dir.path().to_path_buf());
+    // 沙箱写根含 cwd + ~/.cargo + ~/.rustup, 故 cargo 能写 target/ 与 registry 缓存 / .package-cache 锁。
+    // 若写根少了构建缓存, cargo 会在沙箱里失败 —— 本测试正是守这条默认策略。
+    let out = BashTool
+        .call(json!({ "command": "cargo build 2>&1", "sandbox": true, "timeout_ms": 180000 }), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out.content.contains("Finished") || out.content.contains("Compiling sbx"),
+        "cargo build under sandbox failed (build-cache write blocked?):\n{}",
+        out.content
+    );
+}
+
 #[tokio::test]
 async fn glob_lists_files_respecting_gitignore_and_pattern() {
     let dir = tempfile::tempdir().unwrap();

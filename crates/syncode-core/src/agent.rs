@@ -131,6 +131,9 @@ pub struct AgentLoop {
     summarize_fails: u32,
     /// 是否允许本 loop 派生子 agent (§5)。顶层 `true`; 派生出的子 agent 一律 `false` (深度 1, 防递归)。
     sub_agents_enabled: bool,
+    /// 是否给 Bash spawn 的命令施加 OS 内核沙箱 (默认开, 安全优先; macOS Seatbelt 写收容, 其它平台 no-op)。
+    /// [`with_sandbox(false)`](Self::with_sandbox) 关闭 (逃生口)。子 agent 继承父设置 (权限不放宽)。
+    sandbox: bool,
 }
 
 impl AgentLoop {
@@ -155,6 +158,7 @@ impl AgentLoop {
             compaction_boundary: None,
             summarize_fails: 0,
             sub_agents_enabled: false,
+            sandbox: true,
         }
     }
 
@@ -170,6 +174,13 @@ impl AgentLoop {
         self
     }
 
+    /// 启用/禁用对 Bash spawn 命令的 OS 内核沙箱 (默认开)。关掉 = 命令可写工作区外 (逃生口, 如需改 ~ 下
+    /// 非缓存文件的任务)。当前仅 macOS Seatbelt 真生效, 其它平台为 no-op。
+    pub fn with_sandbox(mut self, on: bool) -> Self {
+        self.sandbox = on;
+        self
+    }
+
     /// 构造一个子 agent 派生器: 每次调用跑一个**嵌套** `AgentLoop` 到收尾, 只返回其最终回答。
     /// 子 agent 继承父的 client / 工具集 / 审批器 / cap-std 写收容 / 共享 LSP+文件缓存 (权限**不放宽**),
     /// 但 `sub_agents_enabled=false` (深度 1, 防递归) 且 `events=None` (中间过程不进编排者 transcript)。
@@ -182,6 +193,7 @@ impl AgentLoop {
         let fs = self.fs.clone();
         let cwd = self.cwd.clone();
         let budget = self.budget;
+        let sandbox = self.sandbox;
         Arc::new(move |req: SubAgentRequest| {
             let client = client.clone();
             let tools = tools.clone();
@@ -202,7 +214,8 @@ impl AgentLoop {
                     .with_approver(approver)
                     .with_fs_scope(fs)
                     .with_cwd(cwd.clone())
-                    .with_budget(budget);
+                    .with_budget(budget)
+                    .with_sandbox(sandbox);
                 // 共享父的 LSP 常驻服务器与文件缓存 (高效); sub_agents_enabled 保持 new() 默认 false。
                 nested.files = files;
                 nested.lsp = lsp;
@@ -599,6 +612,7 @@ impl AgentLoop {
         let mut ctx = ToolCtx::with_lsp(self.files.clone(), self.cwd.clone(), self.lsp.clone());
         ctx.fs = self.fs.clone();
         ctx.background = self.background.clone();
+        ctx.sandbox = self.sandbox;
         // 启用 sub-agents 时注入派生器 (子 agent 内部不启用 → 其 ctx.sub_agent 为 None, 深度 1)。
         if self.sub_agents_enabled {
             ctx.sub_agent = Some(self.make_spawner());
