@@ -434,14 +434,26 @@ pub mod macos {
     //! libc 未导出, 故下方自声明 FFI。
 
     use super::{Policy, Sandbox, SandboxError};
-    use std::ffi::{c_char, CStr, CString};
+    use std::ffi::{c_char, c_void, CStr, CString};
     use std::path::Path;
 
-    // Seatbelt C API。`sandbox_init(profile, flags=0, &mut errbuf)`: 0=成功; -1=失败且 errbuf 被填,
-    // 须 `sandbox_free_error` 释放。flags=0 表示 profile 是 SBPL 字符串 (非具名内建)。
+    // 公开 Seatbelt API (libSystem 默认链接)。`sandbox_init(profile, flags=0, &mut errbuf)`:
+    // 0=成功; -1=失败且 errbuf 被填, 须 `sandbox_free_error` 释放。flags=0 表示 profile 是 SBPL 串。
     unsafe extern "C" {
         fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
         fn sandbox_free_error(errorbuf: *mut c_char);
+    }
+
+    // 私有 libsandbox API (sandbox-exec / Chromium 等长期在用, 稳定 ~15 年但无公开头文件)。这些符号**不在**
+    // libSystem 默认导出里, 须显式 `#[link]` 到 SDK 的 libsandbox.tbd 存根。用于把「编译 SBPL」与「装载
+    // profile」拆开: `sandbox_compile_string` 在**父进程 (fork 前)** 把 SBPL 编成不透明 profile (会
+    // malloc/编译, **非** async-signal-safe); `sandbox_apply` 在**子进程 (fork 后、exec 前)** 只做一次
+    // 「装载已编译 profile」的系统调用 (best-effort async-signal-safe) —— 能安全接进 `pre_exec` 的切分。
+    #[link(name = "sandbox")]
+    unsafe extern "C" {
+        fn sandbox_compile_string(data: *const c_char, params: *mut c_void, error: *mut *mut c_char) -> *mut c_void;
+        fn sandbox_apply(profile: *mut c_void) -> i32;
+        fn sandbox_free_profile(profile: *mut c_void);
     }
 
     /// Seatbelt 后端。`apply` 须在**目标进程自身**调用 (理想是子进程 post-fork、pre-exec);
@@ -473,6 +485,62 @@ pub mod macos {
                 return Err(SandboxError::Apply(format!("sandbox_init failed: {msg}")));
             }
             Ok(())
+        }
+    }
+
+    impl MacosSandbox {
+        /// **父进程 / fork 前**: 把 [`Policy`] 编成已编译的 [`CompiledProfile`]。这一步 malloc + 编译
+        /// SBPL, **非** async-signal-safe, 故必须在 fork 前调用; 产物移动进子进程的 `pre_exec` 钩子里
+        /// 用 [`CompiledProfile::apply_in_child`] 装载。这是把 Seatbelt 安全接进 spawn 路径的正道
+        /// (对照 Chromium: compile-in-parent / apply-in-child)。
+        pub fn compile(policy: &Policy) -> Result<CompiledProfile, SandboxError> {
+            let sbpl = compile_profile(policy);
+            let c = CString::new(sbpl)
+                .map_err(|e| SandboxError::Apply(format!("seatbelt: profile has interior NUL: {e}")))?;
+            let mut err: *mut c_char = std::ptr::null_mut();
+            // SAFETY: `c` 在调用期间存活; params=NULL (本 profile 无 `(param ...)` 占位符)。
+            let handle = unsafe { sandbox_compile_string(c.as_ptr(), std::ptr::null_mut(), &mut err) };
+            if handle.is_null() {
+                let msg = if err.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    // SAFETY: 失败时 err 指向有效 C 串。
+                    let s = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
+                    unsafe { sandbox_free_error(err) };
+                    s
+                };
+                return Err(SandboxError::Apply(format!("sandbox_compile_string failed: {msg}")));
+            }
+            Ok(CompiledProfile { handle })
+        }
+    }
+
+    /// 父进程预编译好的 Seatbelt profile, 供子进程 `pre_exec` 装载。`Send`/`Sync`: 句柄由本结构独占,
+    /// fork 后子进程经 COW 读到同一份仍有效。
+    pub struct CompiledProfile {
+        handle: *mut c_void,
+    }
+    unsafe impl Send for CompiledProfile {}
+    unsafe impl Sync for CompiledProfile {}
+
+    impl CompiledProfile {
+        /// **子进程 / fork 后、exec 前**: 装载已编译 profile。只做一次系统调用 (不编译、不分配),
+        /// best-effort async-signal-safe —— 能安全放进 `pre_exec` 的那一步。失败返回 `Err`, 调用方
+        /// 应据此**中止 spawn** (要的沙箱装不上 = fail closed, 绝不让命令裸跑)。
+        pub fn apply_in_child(&self) -> std::io::Result<()> {
+            // SAFETY: handle 是 compile() 产出的有效 profile; fork 后 COW 内存仍有效。
+            let rc = unsafe { sandbox_apply(self.handle) };
+            if rc != 0 {
+                return Err(std::io::Error::other("sandbox_apply failed"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for CompiledProfile {
+        fn drop(&mut self) {
+            // SAFETY: handle 由本结构独占; 仅在父进程 drop (子进程 exec 后映像被替换, Drop 不会跑)。
+            unsafe { sandbox_free_profile(self.handle) };
         }
     }
 
@@ -571,6 +639,16 @@ pub mod macos {
             // allow_network=true → 配置里不应有网络拒绝 (放行决策在更上层)。
             let policy = Policy { allow_network: true, ..Policy::default() };
             assert!(!compile_profile(&policy).contains("deny network"));
+        }
+
+        #[test]
+        fn compile_split_produces_a_profile() {
+            // 验证私有 libsandbox API 能链接 + SBPL 编译成功 (apply 不可撤销, 不能在测试进程里跑,
+            // 故由 syncode-tools 的 BashTool 端到端测真正装载效果)。
+            let root = std::env::temp_dir().join("syncode_seatbelt_compile_root");
+            let _ = std::fs::create_dir_all(&root);
+            let policy = Policy { write_roots: vec![root], ..Policy::default() };
+            let _profile = MacosSandbox::compile(&policy).expect("compile seatbelt profile");
         }
     }
 }

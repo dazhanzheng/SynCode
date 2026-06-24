@@ -569,6 +569,34 @@ async fn bash_can_compile_and_run_rust_under_scrubbed_env() {
     assert!(out.content.contains("sum=55"), "build/run under scrubbed env failed:\n{}", out.content);
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn bash_seatbelt_confines_writes_to_workspace() {
+    // 端到端验证 Seatbelt 接进 Bash 路径 (opt-in "sandbox":true): fork 前编译 profile, 子进程 pre_exec 装载。
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ToolCtx::new(Arc::new(FileStateCache::new()), dir.path().to_path_buf());
+
+    // cwd 内写 → 放行 (Seatbelt 写根 = cwd + tmpdir)。
+    let inside = dir.path().join("ok.txt");
+    let out = BashTool
+        .call(json!({ "command": format!("echo hi > '{}'", inside.display()), "sandbox": true }), &ctx)
+        .await
+        .unwrap();
+    assert!(inside.exists(), "in-cwd sandboxed write should land: {}", out.content);
+
+    // 写根外 (HOME 下, 不在 cwd/tmpdir) → Seatbelt 内核层拒, 不落盘。
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let outside = std::path::PathBuf::from(home).join(".syncode_seatbelt_ESCAPE.txt");
+    let _ = std::fs::remove_file(&outside);
+    let out = BashTool
+        .call(json!({ "command": format!("echo evil > '{}'", outside.display()), "sandbox": true }), &ctx)
+        .await
+        .unwrap();
+    let escaped = outside.exists();
+    let _ = std::fs::remove_file(&outside);
+    assert!(!escaped, "sandboxed out-of-root write must be kernel-denied: {}", out.content);
+}
+
 #[tokio::test]
 async fn glob_lists_files_respecting_gitignore_and_pattern() {
     let dir = tempfile::tempdir().unwrap();

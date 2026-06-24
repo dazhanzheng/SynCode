@@ -117,6 +117,11 @@ impl Tool for BashTool {
             .get("max_memory_mb")
             .and_then(Value::as_u64)
             .map(|mb| mb.saturating_mul(1024 * 1024));
+        // 可选 (opt-in, 默认关): 给 spawn 的命令施加 macOS Seatbelt 内核级写收容。**不进 JSON schema、
+        // 不暴露给模型** —— 内部约定键, 供 agent-loop 按策略 / 测试开启。Linux 的 landlock 对位待接入。
+        let sandbox = args.get("sandbox").and_then(Value::as_bool).unwrap_or(false);
+        #[cfg(not(target_os = "macos"))]
+        let _ = sandbox;
 
         let mut cmd = shell_command(command, shell)?;
         cmd.current_dir(&ctx.cwd);
@@ -128,14 +133,39 @@ impl Tool for BashTool {
         // Unix: 让子进程自成进程组组长, 供超时时 killpg 杀整组 (Windows 走 Job Object, 无此调用)。
         #[cfg(unix)]
         cmd.process_group(0);
-        // Unix 内存硬限: 在子进程 (pre-exec) 里 setrlimit(RLIMIT_AS) —— 仅 max_memory 给定时生效。
-        // ⚠️ eyeball-only (tools crate 因 tree-sitter C 依赖无法 cross-check), 运行时待真机验。
+        // Unix 子进程 (post-fork, pre-exec) 硬限: setrlimit(RLIMIT_AS, 仅 Linux 且给定 max_memory 时) +
+        // macOS Seatbelt 写收容 (opt-in)。Seatbelt 走「fork 前编译、子进程 apply」的切分以保 async-signal-safe。
         #[cfg(unix)]
         {
             let mem = max_memory_bytes;
-            // SAFETY: apply_rlimits 只调 async-signal-safe 的 setrlimit, 在 pre_exec 钩子里安全。
+            // macOS: opt-in 时在 fork 前把 profile 编好 (写根 = cwd + 临时目录, 读放开, 网络放开 ——
+            // 网络由审批器另行把关), 子进程 pre_exec 里只 apply 已编译 profile。compile 失败 → 中止 spawn
+            // (要的沙箱建不起来 = fail closed, 不裸跑)。
+            #[cfg(target_os = "macos")]
+            let compiled = if sandbox {
+                let policy = syncode_sandbox::Policy {
+                    write_roots: vec![ctx.cwd.clone(), std::env::temp_dir()],
+                    allow_network: true,
+                    ..Default::default()
+                };
+                Some(
+                    syncode_sandbox::macos::MacosSandbox::compile(&policy)
+                        .map_err(|e| ToolError::Exec(format!("seatbelt compile failed: {e}")))?,
+                )
+            } else {
+                None
+            };
+            // SAFETY: pre_exec 钩子里只做 async-signal-safe 的系统调用 —— setrlimit, 及装载已编译的
+            // Seatbelt profile (sandbox_apply, 不编译/不分配)。
             unsafe {
-                cmd.pre_exec(move || syncode_sandbox::apply_rlimits(mem));
+                cmd.pre_exec(move || {
+                    syncode_sandbox::apply_rlimits(mem)?;
+                    #[cfg(target_os = "macos")]
+                    if let Some(ref c) = compiled {
+                        c.apply_in_child()?;
+                    }
+                    Ok(())
+                });
             }
         }
 
