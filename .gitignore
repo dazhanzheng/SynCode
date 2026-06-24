@@ -19,6 +19,9 @@ Thumbs.db
 
 # Claude Code 工具产物 (workflow 脚手架脚本等), 本地研究用, 不进仓库。
 .cc-*.workflow.js
+# Claude Code 本地设置 (含 API key / 个人后端路由, 如 DeepSeek) 与运行时锁, 含密钥, 绝不进仓库。
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # 被借鉴的第三方参考源码: 仅本地参考工具设计 (架构 §10), 不随开源仓库分发。
 /claude-code-main/
