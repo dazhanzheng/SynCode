@@ -57,6 +57,51 @@ mod color {
     pub fn danger_bg() -> Hsla { rgba(0xf8514912).into() }
 }
 
+// ═══════════════════════════════════════════════
+//  keystore — API key 的系统钥匙串持久化 (支柱 4: 机密不落明文盘)
+// ═══════════════════════════════════════════════
+/// DeepSeek API key 的安全存储: macOS Keychain / Windows Credential Manager 原生后端。
+/// 设置面板写、worker 启动读 (仅当环境变量 `DEEPSEEK_API_KEY` 未设时)。其它平台无原生后端 → 回退「不支持」。
+mod keystore {
+    /// 钥匙串条目坐标: service = bundle id, account = 环境变量同名 (便于人在「钥匙串访问」里辨识)。
+    const SERVICE: &str = "dev.syncode.app";
+    const ACCOUNT: &str = "DEEPSEEK_API_KEY";
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn load() -> Option<String> {
+        let entry = keyring::Entry::new(SERVICE, ACCOUNT).ok()?;
+        match entry.get_password() {
+            Ok(s) if !s.trim().is_empty() => Some(s),
+            _ => None, // NoEntry / 空 / 读失败 → 视作未配置
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn save(key: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| e.to_string())?;
+        entry.set_password(key).map_err(|e| e.to_string())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn clear() -> Result<(), String> {
+        let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| e.to_string())?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    // 非 macOS/Windows: 无原生钥匙串后端 → 回退「不支持」(仍可用环境变量启动)。
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub fn load() -> Option<String> { None }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub fn save(_key: &str) -> Result<(), String> {
+        Err("secure key storage is not supported on this platform yet".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub fn clear() -> Result<(), String> { Ok(()) }
+}
+
 /// 粗略相对时间 ("just now" / "5m ago" / "3h ago" / "2d ago"), 供历史会话列表展示。
 fn rel_time(updated_at_ms: i64) -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
@@ -83,6 +128,27 @@ enum WorkerMsg {
     ListSessions,
     /// 切到某条历史会话并 resume (transcript 经 resume 通道重建)。
     SwitchSession(String),
+    /// 设置面板提交的 DeepSeek API key: worker 存进 Keychain 并**重建 client/agent** (保留当前会话);
+    /// 空串 = 清除已存 key。回信经 key 通道 (worker → UI) 报告新状态。
+    SetApiKey(String),
+}
+
+/// API key 状态 (worker → UI): 驱动设置面板/警示横幅。`configured` = 此刻能否真的调用 DeepSeek;
+/// `detail` = 人读说明 (来源 env / Keychain / 未配置 / 出错)。
+struct KeyStatus {
+    configured: bool,
+    detail: String,
+}
+
+/// 生成 [`KeyStatus`] 的人读说明。`env_locked` = 启动时 `DEEPSEEK_API_KEY` 环境变量已设 (优先于 Keychain)。
+fn key_detail(configured: bool, env_locked: bool) -> String {
+    if env_locked {
+        "Using DEEPSEEK_API_KEY from the environment (takes precedence over the Keychain).".into()
+    } else if configured {
+        "API key loaded from your macOS Keychain.".into()
+    } else {
+        "No API key set — paste your DeepSeek key below to save it to the Keychain.".into()
+    }
 }
 
 /// agent 的 system prompt: 委托给 `syncode_core` 的**单一真相** builder (CLI/UI 同源, §2),
@@ -158,6 +224,15 @@ struct AgentApp {
     sessions: Vec<SessionMeta>,
     picker_open: bool,
     _picker_drain: Task<()>,
+    /// 设置面板: API key 输入框 (掩码), 是否展开 (展开时主区域换成设置面板)。
+    key_input: Entity<InputState>,
+    settings_open: bool,
+    /// 当前 API key 是否就绪 + 人读状态 (worker 经 key 通道报告)。
+    key_configured: bool,
+    key_detail: String,
+    /// 是否已收到过首个 key 状态 (首启没 key → 自动弹出设置面板, 仅一次)。
+    key_status_seen: bool,
+    _key_drain: Task<()>,
 }
 
 impl AgentApp {
@@ -168,6 +243,7 @@ impl AgentApp {
         appr_rx: smol::channel::Receiver<ApprovalRequest>,
         resume_rx: smol::channel::Receiver<Vec<Message>>,
         picker_rx: smol::channel::Receiver<Vec<SessionMeta>>,
+        key_rx: smol::channel::Receiver<KeyStatus>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -180,6 +256,18 @@ impl AgentApp {
         cx.subscribe_in(&input, window, |this, _input, event, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.submit(window, cx);
+            }
+        })
+        .detach();
+        // 设置面板的 API key 输入框: 掩码 (••••), Enter 即保存。
+        let key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("sk-… (paste your DeepSeek API key, Enter to save)")
+        });
+        cx.subscribe_in(&key_input, window, |this, _input, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.save_api_key(window, cx);
             }
         })
         .detach();
@@ -239,6 +327,25 @@ impl AgentApp {
                 }
             }
         });
+        // 抽干 key 状态流 (worker 报告 API key 是否就绪) → 更新横幅/面板; 首启没 key 自动弹设置。
+        let key_drain = cx.spawn(async move |weak, cx| {
+            while let Ok(status) = key_rx.recv().await {
+                let updated = weak.update(cx, |this, cx| {
+                    this.key_configured = status.configured;
+                    this.key_detail = status.detail;
+                    if !this.key_status_seen {
+                        this.key_status_seen = true;
+                        if !status.configured {
+                            this.settings_open = true; // 首启缺 key → 直接打开设置, 引导填入
+                        }
+                    }
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
         let lines = vec![Line::Status("Ready — edit the task and press Enter (or Send).".into())];
         Self {
             // ListState 项数必须与 lines 同步 (初始 1 行)。Bottom 对齐 → 新内容贴底。
@@ -263,6 +370,12 @@ impl AgentApp {
             sessions: Vec::new(),
             picker_open: false,
             _picker_drain: picker_drain,
+            key_input,
+            settings_open: false,
+            key_configured: false,
+            key_detail: String::new(),
+            key_status_seen: false,
+            _key_drain: key_drain,
         }
     }
 
@@ -512,6 +625,7 @@ impl AgentApp {
         let _ = self.task_tx.try_send(WorkerMsg::Reset);
         self.reset_lines(vec![Line::Status("New chat — started a fresh session.".into())]);
         self.usage = UsageTotals::default();
+        self.settings_open = false;
         cx.notify();
     }
 
@@ -521,6 +635,7 @@ impl AgentApp {
             return;
         }
         let _ = self.task_tx.try_send(WorkerMsg::ListSessions);
+        self.settings_open = false;
         cx.notify();
     }
 
@@ -535,6 +650,30 @@ impl AgentApp {
     /// 关闭历史会话选择器 (不切会话)。
     fn close_session_picker(&mut self, cx: &mut Context<Self>) {
         self.picker_open = false;
+        cx.notify();
+    }
+
+    /// 打开设置面板 (主区域换成设置), 顺手收起历史选择器。
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.picker_open = false;
+        self.settings_open = true;
+        cx.notify();
+    }
+
+    /// 关闭设置面板 (回到 transcript)。
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        cx.notify();
+    }
+
+    /// 保存设置面板里填的 API key: 发给 worker (存 Keychain + 重建 client/agent 用新 key)。空串 = 清除。
+    /// **不在此处下结论**: 保存/清除的成败是异步的, 面板保持打开, 由 worker 经 key 通道回报的真实
+    /// `key_detail` 在状态行如实反映 (避免「明明没存上却报已保存」)。用户看到结果后自行点 Close。
+    fn save_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.key_input.read(cx).value().trim().to_string();
+        let _ = self.task_tx.try_send(WorkerMsg::SetApiKey(key));
+        // 清掉输入, 别把 key 以圆点形式留在框里。
+        self.key_input.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
     }
 
@@ -966,7 +1105,9 @@ impl Render for AgentApp {
                 // 主区域: picker 展开时换成历史会话选择器, 否则是 transcript。
                 // transcript = 变高虚拟列表 (list, 只渲可见行 → 内容多也不卡) + 右侧 12px 滚动条槽。
                 // 外层 flex_1+min_h(0) 给定有界视口高; list 自己处理滚动/滚轮/贴底; 滚动条读 list_state。
-                .child(if self.picker_open {
+                .child(if self.settings_open {
+                    self.render_settings(cx).into_any_element()
+                } else if self.picker_open {
                     self.render_session_picker(cx).into_any_element()
                 } else {
                     div()
@@ -997,6 +1138,11 @@ impl Render for AgentApp {
                 })
                 // 审批卡片 (仅在有在途 Ask 请求时): 阻塞中, 等人点 Allow once / Deny。
                 .children(self.pending_approval.as_ref().map(|p| self.render_approval(p, cx)))
+                // 缺 API key 警示横幅 (设置面板未开时): 一键打开设置。
+                .children(
+                    (!self.key_configured && !self.settings_open)
+                        .then(|| self.render_key_banner(cx)),
+                )
                 .child(self.render_usage(cx))
                 .child(self.render_input(running, cx)),
         )
@@ -1131,6 +1277,15 @@ impl AgentApp {
                                     .disabled(running)
                                     .on_click(cx.listener(|this, _ev, window, cx| {
                                         this.open_workspace(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("settings")
+                                    .ghost()
+                                    .label("⚙ API key")
+                                    .disabled(running)
+                                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                                        this.open_settings(cx)
                                     })),
                             )
                             .child(
@@ -1286,6 +1441,115 @@ impl AgentApp {
                             .label("Send ↗")
                             .on_click(cx.listener(|this, _ev, window, cx| this.submit(window, cx)))
                     }),
+            )
+    }
+
+    /// 设置面板 (主区域内): 当场粘贴 DeepSeek API key → 存进 macOS Keychain → 立即生效。
+    /// 复用与底部任务框同款的输入框外观 (掩码显示)。状态行实时反映来源 (env / Keychain / 未配置)。
+    fn render_settings(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let status_color = if self.key_configured { color::green() } else { color::amber() };
+        v_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .gap_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().text_color(theme.foreground).child("Settings — DeepSeek API key"))
+                    .child(
+                        Button::new("close-settings").ghost().label("Close").on_click(
+                            cx.listener(|this, _ev, _window, cx| this.close_settings(cx)),
+                        ),
+                    ),
+            )
+            // 当前状态行 (绿=就绪 / 琥珀=缺失或注意)。
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().size(px(7.)).rounded_full().bg(status_color).flex_shrink_0())
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.foreground)
+                            .child(self.key_detail.clone()),
+                    ),
+            )
+            // 安全说明。
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        "Stored securely in your macOS Keychain (service “dev.syncode.app”). \
+                         The DEEPSEEK_API_KEY environment variable, if set at launch, takes precedence.",
+                    ),
+            )
+            // 掩码输入框 (同底部任务框外观)。
+            .child(
+                div()
+                    .rounded(px(8.))
+                    .bg(color::surface())
+                    .border_1()
+                    .border_color(theme.border)
+                    .px_3()
+                    .py_2()
+                    .child(TextInput::new(&self.key_input).appearance(false)),
+            )
+            // 动作: Save (主) + Clear (危险, 删除已存 key)。
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("save-key")
+                            .primary()
+                            .label("Save key")
+                            .on_click(cx.listener(|this, _ev, window, cx| {
+                                this.save_api_key(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("clear-key").ghost().label("Clear").on_click(cx.listener(
+                            |this, _ev, window, cx| {
+                                this.key_input.update(cx, |s, cx| s.set_value("", window, cx));
+                                this.save_api_key(window, cx);
+                            },
+                        )),
+                    ),
+            )
+    }
+
+    /// 缺 API key 警示横幅: 红底琥珀框 + 「Set API key」按钮 (一键打开设置)。
+    fn render_key_banner(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        h_flex()
+            .justify_between()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded(px(8.))
+            .bg(color::danger_bg())
+            .border_1()
+            .border_color(color::amber())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child("⚠ No API key — SynCode can't reach DeepSeek until you add your key."),
+            )
+            .child(
+                Button::new("banner-set-key")
+                    .primary()
+                    .label("Set API key")
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.open_settings(cx))),
             )
     }
 }
@@ -1490,6 +1754,7 @@ fn run_agent_worker(
     cancel_rx: smol::channel::Receiver<()>,
     resume_tx: smol::channel::Sender<Vec<Message>>,
     picker_tx: smol::channel::Sender<Vec<SessionMeta>>,
+    key_tx: smol::channel::Sender<KeyStatus>,
 ) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -1499,31 +1764,7 @@ fn run_agent_worker(
         }
     };
     rt.block_on(async move {
-        let cfg = match DeepSeekConfig::from_env() {
-            Ok(c) => c,
-            Err(_) => {
-                let _ = event_tx.try_send(AgentEvent::AssistantText(
-                    "DEEPSEEK_API_KEY not set — load it before launching to run live.".into(),
-                ));
-                let _ = event_tx.try_send(AgentEvent::TurnDone);
-                // 仍消费任务队列, 每个 Task 都报同样的提示 (Reset 静默忽略)。
-                while let Ok(msg) = task_rx.recv().await {
-                    if let WorkerMsg::Task(_) = msg {
-                        let _ = event_tx.try_send(AgentEvent::AssistantText("(no API key)".into()));
-                        let _ = event_tx.try_send(AgentEvent::TurnDone);
-                    }
-                }
-                return;
-            }
-        };
-        let client = match DeepSeekClient::new(cfg) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = event_tx.try_send(AgentEvent::AssistantText(format!("client init failed: {e}")));
-                return;
-            }
-        };
-        let client = Arc::new(client);
+        // event sink + Ask 升级钩子: 不依赖 API key, 一次建好 (跨 client 重建复用)。
         let sink_tx = event_tx.clone();
         let sink: EventSink = Arc::new(move |e| {
             let _ = sink_tx.try_send(e);
@@ -1542,13 +1783,13 @@ fn run_agent_worker(
         });
         // 会话持久化 DB (按 workspace 一份; session_id = 规范化路径)。取不到目录则降级纯内存。
         let db_path = session_db_path();
-        // 给定根造一个 AgentLoop: cwd / 审批写根 / FsScope 收容根都钉在该根 (单一真相 #14)。
-        // 切 workspace 时整体重建 (新根 = 新 PolicyApprover / FsScope / cwd; 工具缓存 / LSP 也重置)。
+        // 给定 client + 根造一个 AgentLoop: cwd / 审批写根 / FsScope 收容根都钉在该根 (单一真相 #14)。
+        // 切 workspace 或换 API key 时整体重建 (新 client / 新 PolicyApprover / FsScope / cwd)。
         // 挂持久化: 每个 workspace 一份历史 (开机/切换自动 resume)。
-        let make_agent = |root: &Path| -> AgentLoop {
+        let make_agent = |client: Arc<DeepSeekClient>, root: &Path| -> AgentLoop {
             let mut registry = ToolRegistry::new();
             register_builtins(&mut registry);
-            let mut agent = AgentLoop::new(client.clone(), registry)
+            let mut agent = AgentLoop::new(client, registry)
                 .with_approver(Arc::new(PolicyApprover::new(root)))
                 .with_fs_scope(Some(Arc::new(FsScope::new(root))))
                 .with_cwd(root)
@@ -1573,56 +1814,158 @@ fn run_agent_worker(
             }
         };
 
+        // API key 解析: 环境变量优先 (终端/harness 行为不变), 否则读 Keychain。env 已设 = 后续仍以它为准。
+        let env_key = std::env::var("DEEPSEEK_API_KEY").ok().filter(|s| !s.trim().is_empty());
+        let env_locked = env_key.is_some();
+        let initial_key = env_key.or_else(keystore::load);
+
         let mut root = std::env::current_dir().unwrap_or_default();
-        let mut agent = make_agent(&root);
-        // 常驻 session: 跨任务累积 (多轮)。Reset / 切 workspace 时整体重建。
-        let mut session = resume(&agent, &root);
-        let _ = resume_tx.try_send(session.messages().to_vec());
+        // client / agent / session 现在都是 Option: 没 key 时为 None, 用户在设置里填入后再建。
+        let mut client: Option<Arc<DeepSeekClient>> = initial_key
+            .and_then(|k| DeepSeekClient::new(DeepSeekConfig::new(k)).ok().map(Arc::new));
+        let mut agent: Option<AgentLoop> = client.clone().map(|c| make_agent(c, &root));
+        let mut session: Option<Session> = agent.as_ref().map(|a| resume(a, &root));
+        if let Some(s) = &session {
+            let _ = resume_tx.try_send(s.messages().to_vec());
+        }
+        // 首报状态: UI 据此决定是否弹设置面板 / 显示横幅。
+        let _ = key_tx.try_send(KeyStatus {
+            configured: client.is_some(),
+            detail: key_detail(client.is_some(), env_locked),
+        });
+
         while let Ok(msg) = task_rx.recv().await {
             match msg {
+                WorkerMsg::SetApiKey(key) => {
+                    let key = key.trim().to_string();
+                    if key.is_empty() {
+                        // 空 = 清除已存 key。删除成功才把内存置 None (回到「未配置」, 在途会话丢弃);
+                        // 删除失败则保持现状并如实报错 —— 别让内存说「没 key」而钥匙串里还留着 (下次启动又冒出来)。
+                        match keystore::clear() {
+                            Ok(()) => {
+                                client = None;
+                                agent = None;
+                                session = None;
+                                let _ = key_tx.try_send(KeyStatus {
+                                    configured: false,
+                                    detail: key_detail(false, env_locked),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = key_tx.try_send(KeyStatus {
+                                    configured: client.is_some(),
+                                    detail: format!("Couldn't remove the key from the Keychain: {e}"),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    match DeepSeekClient::new(DeepSeekConfig::new(key.clone())) {
+                        Ok(c) => {
+                            // 存进钥匙串 (失败也不阻断本次会话, 但要如实回报 —— 不谎称已保存)。
+                            let saved = keystore::save(&key);
+                            let c = Arc::new(c);
+                            let was_none = agent.is_none();
+                            // 换 key 前记下当前会话 id: make_agent 重建会把 store 指针拨到「最近一条」,
+                            // 必须拨回用户此刻所在会话, 否则后续 run_turn 落库串到别的会话。
+                            let prev_sid = agent.as_ref().map(|a| a.current_session_id().to_string());
+                            let mut a = make_agent(c.clone(), &root);
+                            client = Some(c);
+                            if was_none {
+                                // 首次设 key: 载入该 workspace 历史并让 UI 重建 transcript。
+                                let s = resume(&a, &root);
+                                let _ = resume_tx.try_send(s.messages().to_vec());
+                                session = Some(s);
+                            } else if let Some(sid) = prev_sid {
+                                // 换 key: 仅把新 agent 拨回当前会话; 内存 session 与 UI transcript 原样保留。
+                                a.switch_session(sid);
+                            }
+                            agent = Some(a);
+                            // 如实状态: 保存失败 / (env 下次启动仍会覆盖) / 已保存。client 现已用新 key 运行。
+                            let detail = match &saved {
+                                Err(e) => format!(
+                                    "Key active for this session, but saving to the Keychain failed: {e}"
+                                ),
+                                Ok(()) if env_locked =>
+                                    "API key saved to the Keychain and active now. Note: the DEEPSEEK_API_KEY \
+                                     environment variable will take precedence again on the next launch."
+                                        .into(),
+                                Ok(()) => "API key saved to your macOS Keychain.".into(),
+                            };
+                            let _ = key_tx.try_send(KeyStatus { configured: true, detail });
+                        }
+                        Err(e) => {
+                            let _ = key_tx.try_send(KeyStatus {
+                                configured: client.is_some(),
+                                detail: format!("client init failed: {e}"),
+                            });
+                        }
+                    }
+                }
                 WorkerMsg::Reset => {
-                    // New chat: 新开一条会话 (不删旧的; 旧会话进历史可回看)。
-                    agent.start_new_session();
-                    session = Session::with_system(system_prompt(&root));
-                    // UI 侧已自行 reset 到 "New chat" 状态, 不必再 send resume。
+                    // New chat: 新开一条会话 (不删旧的; 旧会话进历史可回看)。没 key 时无操作。
+                    if let Some(a) = agent.as_mut() {
+                        a.start_new_session();
+                        session = Some(Session::with_system(system_prompt(&root)));
+                    }
                 }
                 WorkerMsg::ListSessions => {
-                    let _ = picker_tx.try_send(agent.sessions());
+                    if let Some(a) = agent.as_ref() {
+                        let _ = picker_tx.try_send(a.sessions());
+                    }
                 }
                 WorkerMsg::SwitchSession(id) => {
-                    agent.switch_session(id);
-                    session = resume(&agent, &root); // 载入该会话历史
-                    let _ = resume_tx.try_send(session.messages().to_vec()); // UI 重建 transcript
+                    if let Some(a) = agent.as_mut() {
+                        a.switch_session(id);
+                        let s = resume(a, &root); // 载入该会话历史
+                        let _ = resume_tx.try_send(s.messages().to_vec()); // UI 重建 transcript
+                        session = Some(s);
+                    }
                 }
                 WorkerMsg::SetWorkspace(path) => {
                     root = path;
-                    agent = make_agent(&root); // 重建: 新根钉进两闸 + cwd + 该 workspace 的 store
-                    session = resume(&agent, &root); // 载入新 workspace 的历史
-                    let _ = resume_tx.try_send(session.messages().to_vec()); // 让 UI 重建 transcript
-                }
-                WorkerMsg::Task(task) => {
-                    session.push_user(&task);
-                    // 清掉本轮开始前残留的 cancel 信号 (上一次 Stop 的余波别误杀新 turn)。
-                    while cancel_rx.try_recv().is_ok() {}
-                    // run_turn 跑这一轮; 同时盯着 cancel —— Stop 触发 → 丢弃 run_turn future
-                    // (在途 HTTP 请求随之中止)。cancel 分支体不碰 agent/session, 借用在 select! 结束即释放。
-                    let cancelled = tokio::select! {
-                        r = agent.run_turn(&mut session) => {
-                            if let Err(e) = r {
-                                let _ = event_tx
-                                    .try_send(AgentEvent::AssistantText(format!("⚠ turn error: {e}")));
-                                let _ = event_tx.try_send(AgentEvent::TurnDone);
-                            }
-                            false
-                        }
-                        _ = cancel_rx.recv() => true,
-                    };
-                    if cancelled {
-                        // 修复半截 turn 使会话合法、可继续 (悬空 tool_call 补「中断」结果 + 中断标记)。
-                        session.repair_after_interrupt();
-                        let _ = event_tx.try_send(AgentEvent::Interrupted);
+                    // 有 client 才重建 agent; 没 key 时仅记下新根 (填 key 时用它建)。
+                    if let Some(c) = client.clone() {
+                        let a = make_agent(c, &root); // 新根钉进两闸 + cwd + 该 workspace 的 store
+                        let s = resume(&a, &root); // 载入新 workspace 的历史
+                        let _ = resume_tx.try_send(s.messages().to_vec()); // 让 UI 重建 transcript
+                        agent = Some(a);
+                        session = Some(s);
                     }
                 }
+                WorkerMsg::Task(task) => match (agent.as_mut(), session.as_mut()) {
+                    (Some(agent), Some(session)) => {
+                        session.push_user(&task);
+                        // 清掉本轮开始前残留的 cancel 信号 (上一次 Stop 的余波别误杀新 turn)。
+                        while cancel_rx.try_recv().is_ok() {}
+                        // run_turn 跑这一轮; 同时盯着 cancel —— Stop 触发 → 丢弃 run_turn future
+                        // (在途 HTTP 请求随之中止)。cancel 分支体不碰 agent/session, 借用在 select! 结束即释放。
+                        let cancelled = tokio::select! {
+                            r = agent.run_turn(session) => {
+                                if let Err(e) = r {
+                                    let _ = event_tx
+                                        .try_send(AgentEvent::AssistantText(format!("⚠ turn error: {e}")));
+                                    let _ = event_tx.try_send(AgentEvent::TurnDone);
+                                }
+                                false
+                            }
+                            _ = cancel_rx.recv() => true,
+                        };
+                        if cancelled {
+                            // 修复半截 turn 使会话合法、可继续 (悬空 tool_call 补「中断」结果 + 中断标记)。
+                            session.repair_after_interrupt();
+                            let _ = event_tx.try_send(AgentEvent::Interrupted);
+                        }
+                    }
+                    _ => {
+                        // 没 key: 提示去设置里填 (而不是静默失败)。
+                        let _ = event_tx.try_send(AgentEvent::AssistantText(
+                            "No API key configured — open ⚙ API key and paste your DeepSeek key."
+                                .into(),
+                        ));
+                        let _ = event_tx.try_send(AgentEvent::TurnDone);
+                    }
+                },
             }
         }
     });
@@ -1641,10 +1984,12 @@ fn main() {
         let (resume_tx, resume_rx) = smol::channel::unbounded::<Vec<Message>>();
         // picker 通道 (worker → UI): History 按钮请求时, worker 把会话列表发回 → 弹出选择器。
         let (picker_tx, picker_rx) = smol::channel::unbounded::<Vec<SessionMeta>>();
+        // key 状态通道 (worker → UI): 启动/保存后报告 API key 是否就绪 → UI 弹设置面板 / 显示横幅。
+        let (key_tx, key_rx) = smol::channel::unbounded::<KeyStatus>();
 
         // agent worker 独立线程 (自带 tokio runtime)。
         thread::spawn(move || {
-            run_agent_worker(task_rx, event_tx, appr_tx, cancel_rx, resume_tx, picker_tx)
+            run_agent_worker(task_rx, event_tx, appr_tx, cancel_rx, resume_tx, picker_tx, key_tx)
         });
 
         cx.spawn(async move |cx| {
@@ -1663,7 +2008,8 @@ fn main() {
             cx.open_window(options, |window, cx| {
                 let view = cx.new(|cx| {
                     AgentApp::new(
-                        task_tx, cancel_tx, event_rx, appr_rx, resume_rx, picker_rx, window, cx,
+                        task_tx, cancel_tx, event_rx, appr_rx, resume_rx, picker_rx, key_rx, window,
+                        cx,
                     )
                 });
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))

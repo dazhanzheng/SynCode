@@ -25,6 +25,14 @@ syncode-tools = { path = "../syncode-tools" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 smol = "2"
 
+# API key 安全存储 (设置面板把 DeepSeek key 写进系统钥匙串): macOS Keychain / Windows Credential
+# Manager 原生后端, 无额外系统依赖。其它平台 (Linux) 暂回退为「不支持」(见 main.rs 的 keystore 模块)。
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
 # gpui 历史上需要 psm 的 git 版本 (栈管理); 沿用 gpui-component 的同款 patch。
 [patch.crates-io]
 psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
